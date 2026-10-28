@@ -17,9 +17,9 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 ### Screen
 
 - Header: current branch, what it's compared against (its upstream, else `origin/main` or `origin/master`), commits ahead/behind, and a red banner while a rebase is in progress.
-- Left: your unpushed commits, plus the 10 pushed commits below them, which are greyed out. Each shows short hash, date, author and co-authors, and summary. The upstream's position is labelled, e.g. `[origin/main]`. Newest is on top, and the oldest unpushed commit is selected at start.
+- Left: `UNSTAGED` (including untracked files) and `STAGED` entries at the top when there are such changes, showing who a commit would be by, then your unpushed commits, plus the 10 pushed commits below them, which are greyed out. Each shows short hash, date, author and co-authors, and summary. The upstream's position is labelled, e.g. `[origin/main]`. Newest is on top, and the oldest unpushed commit is selected at start.
 - Right: full message, stat and coloured diff, soft-wrapped. A cyan bar in the gutter marks the current hunk for `j`/`k`: the one you last jumped to while it's in view, else the last hunk in view.
-- The list refreshes by itself when HEAD or the upstream moves (checked every second), keeping your selection, even if the selected commit was rewritten elsewhere.
+- The list refreshes by itself when HEAD, the upstream or uncommitted changes change (checked every second), keeping your selection, even if the selected commit was rewritten elsewhere.
 
 ### Keys
 

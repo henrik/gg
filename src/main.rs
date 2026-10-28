@@ -4,7 +4,7 @@ mod rewrite;
 
 use ansi_to_tui::IntoText;
 use anyhow::{Result, bail};
-use git::{Commit, Repo};
+use git::{Commit, Kind, Repo};
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::{
@@ -139,8 +139,8 @@ impl App {
                     KeyCode::Char('b') => self.rebase(terminal)?,
                     KeyCode::Char('p') => self.confirm_push("HEAD".into()),
                     KeyCode::Char('P') => {
-                        if let Some(commit) = self.selected_commit() {
-                            self.confirm_push(commit.hash.clone());
+                        if let Some(commit) = self.selected_real_commit() {
+                            self.confirm_push(commit.hash);
                         }
                     }
                     KeyCode::Char('a') => self.amend(terminal)?,
@@ -164,7 +164,7 @@ impl App {
         if let Some(base) = &self.base {
             out += &self.repo.run(&["rev-parse", base]).unwrap_or_default();
         }
-        out
+        out + &self.repo.worktree_fingerprint()
     }
 
     fn reload(&mut self, prefer: Option<&str>) -> Result<()> {
@@ -174,7 +174,12 @@ impl App {
         self.branch = self.repo.branch();
         self.base = self.repo.base_ref();
         (self.ahead, self.behind) = self.base.as_deref().map(|b| self.repo.ahead_behind(b)).unwrap_or((0, 0));
-        self.commits = self.repo.commits(self.base.as_deref(), PUSHED_COMMITS_SHOWN)?;
+        self.commits = self.repo.uncommitted();
+        self.commits.extend(self.repo.commits(self.base.as_deref(), PUSHED_COMMITS_SHOWN)?);
+        self.diffs.retain(|hash, _| !hash.starts_with("gg:"));
+        if self.wrapped.as_ref().is_some_and(|(hash, _, _)| hash.starts_with("gg:")) {
+            self.wrapped = None;
+        }
         self.fingerprint = self.current_fingerprint();
 
         let find = |hash: &str| self.commits.iter().position(|c| c.hash == hash);
@@ -228,9 +233,10 @@ impl App {
     }
 
     fn diff(&mut self) -> Option<&Text<'static>> {
-        let hash = self.selected_commit()?.hash.clone();
+        let entry = self.selected_commit()?.clone();
+        let hash = entry.hash.clone();
         if !self.diffs.contains_key(&hash) {
-            let text = match self.repo.show(&hash) {
+            let text = match self.repo.show_entry(&entry) {
                 Ok(bytes) => {
                     let bytes = String::from_utf8_lossy(&bytes).replace('\t', "    ");
                     bytes.into_bytes().into_text().unwrap_or_else(|e| Text::raw(e.to_string()))
@@ -294,7 +300,7 @@ impl App {
     }
 
     fn reword(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        let Some(commit) = self.selected_commit().cloned() else { return Ok(()) };
+        let Some(commit) = self.selected_real_commit() else { return Ok(()) };
         if commit.pushed {
             self.set_status(format!("{} is already pushed – not rewording", commit.short), true);
             return Ok(());
@@ -357,8 +363,18 @@ impl App {
         Ok(())
     }
 
-    fn amendable_commit(&mut self) -> Option<Commit> {
+    // The selected entry unless it's uncommitted changes, which commit actions don't apply to.
+    fn selected_real_commit(&mut self) -> Option<Commit> {
         let commit = self.selected_commit().cloned()?;
+        if commit.kind != Kind::Commit {
+            self.set_status(format!("{} changes aren't a commit", commit.short), true);
+            return None;
+        }
+        Some(commit)
+    }
+
+    fn amendable_commit(&mut self) -> Option<Commit> {
+        let commit = self.selected_real_commit()?;
         if commit.pushed {
             self.set_status(format!("{} is already pushed – not amending", commit.short), true);
             return None;
@@ -659,6 +675,17 @@ impl App {
             .commits
             .iter()
             .map(|c| {
+                if c.kind != Kind::Commit {
+                    let badge = if c.kind == Kind::Staged { Color::Green } else { Color::Red };
+                    let first = Line::from(vec![
+                        Span::styled(format!(" {} ", c.short.to_uppercase()), Style::new().fg(Color::Black).bg(badge).add_modifier(Modifier::BOLD)),
+                        Span::raw(" "),
+                        Span::styled(c.authors.join(", "), Style::new().fg(Color::Green)),
+                    ]);
+                    let second = Line::from(Span::styled(format!("  {}", c.summary), Style::new().fg(badge).add_modifier(Modifier::ITALIC)));
+                    return ListItem::new(vec![first, second]);
+                }
+
                 let style = |color: Color| Style::new().fg(if c.pushed { DIM } else { color });
                 let first = Line::from(vec![
                     Span::styled(c.short.clone(), style(Color::Yellow)),

@@ -4,18 +4,44 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+const MAX_UNTRACKED_DIFFS: usize = 50;
+
 pub struct Repo {
     pub dir: PathBuf,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum Kind {
+    Commit,
+    Unstaged,
+    Staged,
+}
+
+// A commit, or a pseudo-entry for uncommitted changes.
 #[derive(Clone)]
 pub struct Commit {
+    pub kind: Kind,
     pub hash: String,
     pub short: String,
     pub date: String,
     pub authors: Vec<String>,
     pub summary: String,
     pub pushed: bool,
+}
+
+impl Commit {
+    fn uncommitted(kind: Kind, authors: &[String], summary: String) -> Self {
+        let label = if kind == Kind::Staged { "Staged" } else { "Unstaged" };
+        Self {
+            kind,
+            hash: format!("gg:{}", label.to_lowercase()),
+            short: label.into(),
+            date: String::new(),
+            authors: authors.to_vec(),
+            summary,
+            pushed: false,
+        }
+    }
 }
 
 impl Repo {
@@ -136,6 +162,7 @@ impl Repo {
                     }
                 }
                 Commit {
+                    kind: Kind::Commit,
                     hash: f[0].to_string(),
                     short: f[1].to_string(),
                     date: f[2].to_string(),
@@ -145,6 +172,89 @@ impl Repo {
                 }
             })
             .collect())
+    }
+
+    // Entries for unstaged (including untracked) and staged changes, each only if non-empty.
+    pub fn uncommitted(&self) -> Vec<Commit> {
+        let authors = self.current_authors();
+        let untracked = self.untracked().len();
+        let mut entries = Vec::new();
+
+        let unstaged_stat = self.run(&["diff", "--shortstat"]).unwrap_or_default();
+        if !unstaged_stat.trim().is_empty() || untracked > 0 {
+            let mut summary = unstaged_stat.trim().to_string();
+            if untracked > 0 {
+                let files = if untracked == 1 { "1 untracked file".to_string() } else { format!("{untracked} untracked files") };
+                summary = if summary.is_empty() { files } else { format!("{summary}, {files}") };
+            }
+            entries.push(Commit::uncommitted(Kind::Unstaged, &authors, summary));
+        }
+
+        let staged_stat = self.run(&["diff", "--cached", "--shortstat"]).unwrap_or_default();
+        if !staged_stat.trim().is_empty() {
+            entries.push(Commit::uncommitted(Kind::Staged, &authors, staged_stat.trim().to_string()));
+        }
+        entries
+    }
+
+    // Who a commit made now would be by: the configured author plus any co-authors in the commit template.
+    fn current_authors(&self) -> Vec<String> {
+        let ident = self.run(&["var", "GIT_AUTHOR_IDENT"]).unwrap_or_default();
+        let mut authors = vec![ident.split('<').next().unwrap_or("").trim().to_string()];
+
+        let template = self.run(&["config", "--path", "commit.template"]).unwrap_or_default();
+        if let Ok(content) = std::fs::read_to_string(self.dir.join(template.trim())) {
+            for line in content.lines() {
+                if let Some((key, value)) = line.split_once(':')
+                    && key.trim().eq_ignore_ascii_case("co-authored-by")
+                {
+                    authors.push(value.split('<').next().unwrap_or("").trim().to_string());
+                }
+            }
+        }
+        authors.retain(|a| !a.is_empty());
+        authors
+    }
+
+    fn untracked(&self) -> Vec<String> {
+        let out = self.run_bytes(&["ls-files", "--others", "--exclude-standard", "-z"], None).unwrap_or_default();
+        String::from_utf8_lossy(&out).split('\0').filter(|p| !p.is_empty()).map(String::from).collect()
+    }
+
+    // Changes in status, file contents or the index, for noticing uncommitted changes.
+    pub fn worktree_fingerprint(&self) -> String {
+        let status = self.run_bytes(&["status", "--porcelain=v1", "-z"], None).unwrap_or_default();
+        let status = String::from_utf8_lossy(&status).into_owned();
+        let mut out = status.clone();
+        let paths = status.split('\0').filter_map(|entry| entry.get(3..)).chain(std::iter::once(""));
+        for path in paths {
+            let path = if path.is_empty() { self.git_path("index").unwrap_or_default() } else { self.dir.join(path) };
+            if let Ok(meta) = std::fs::metadata(&path) {
+                out += &format!("{:?}{}", meta.modified().ok(), meta.len());
+            }
+        }
+        out
+    }
+
+    pub fn show_entry(&self, entry: &Commit) -> Result<Vec<u8>> {
+        match entry.kind {
+            Kind::Commit => self.show(&entry.hash),
+            Kind::Staged => self.run_bytes(&["diff", "--cached", "--color=always", "--stat", "--patch"], None),
+            Kind::Unstaged => {
+                let mut out = self.run_bytes(&["diff", "--color=always", "--stat", "--patch"], None)?;
+                let untracked = self.untracked();
+                for path in untracked.iter().take(MAX_UNTRACKED_DIFFS) {
+                    // Exits with 1 when there are differences, which there always are.
+                    let diff = self.command().args(["diff", "--color=always", "--no-index", "--", "/dev/null", path]).output()?;
+                    out.push(b'\n');
+                    out.extend_from_slice(&diff.stdout);
+                }
+                if untracked.len() > MAX_UNTRACKED_DIFFS {
+                    out.extend_from_slice(format!("\n…and {} more untracked files\n", untracked.len() - MAX_UNTRACKED_DIFFS).as_bytes());
+                }
+                Ok(out)
+            }
+        }
     }
 
     pub fn show(&self, hash: &str) -> Result<Vec<u8>> {
