@@ -22,6 +22,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 const PUSHED_COMMITS_SHOWN: usize = 10;
+const MIN_PANE_WIDTH: u16 = 30;
 const MOUSE_SCROLL_ROWS: usize = 3;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DIM: Color = Color::DarkGray;
@@ -52,6 +53,10 @@ struct App {
     jumped_to_hunk: Option<usize>,
     commits_area: ratatui::layout::Rect,
     pending_push: Option<PendingPush>,
+    // Set once the user drags the separator.
+    list_width: Option<u16>,
+    dragging_separator: bool,
+    main_area: ratatui::layout::Rect,
     status: Option<(String, bool)>,
     pending_amend: Option<amend::Scratch>,
     fingerprint: String,
@@ -77,6 +82,9 @@ fn main() -> Result<()> {
         jumped_to_hunk: None,
         commits_area: ratatui::layout::Rect::default(),
         pending_push: None,
+        list_width: None,
+        dragging_separator: false,
+        main_area: ratatui::layout::Rect::default(),
         status: None,
         pending_amend: None,
         fingerprint: String::new(),
@@ -103,7 +111,15 @@ impl App {
                         match mouse.kind {
                             MouseEventKind::ScrollDown => self.diff_scroll = (self.diff_scroll + MOUSE_SCROLL_ROWS).min(self.max_scroll()),
                             MouseEventKind::ScrollUp => self.diff_scroll = self.diff_scroll.saturating_sub(MOUSE_SCROLL_ROWS),
+                            MouseEventKind::Down(MouseButton::Left) if self.on_separator(mouse.column, mouse.row) => {
+                                self.dragging_separator = true;
+                            }
                             MouseEventKind::Down(MouseButton::Left) => self.click_commit(mouse.column, mouse.row),
+                            MouseEventKind::Drag(MouseButton::Left) if self.dragging_separator => {
+                                let main = self.main_area;
+                                self.list_width = Some(clamp_list_width(mouse.column.saturating_sub(main.x) + 1, main.width));
+                            }
+                            MouseEventKind::Up(MouseButton::Left) => self.dragging_separator = false,
                             _ => {}
                         }
                         continue;
@@ -213,6 +229,13 @@ impl App {
             self.diff_scroll = 0;
             self.jumped_to_hunk = None;
         }
+    }
+
+    // The separator is the list's right border; the column right of it counts too, to be easier to grab.
+    fn on_separator(&self, column: u16, row: u16) -> bool {
+        let area = self.commits_area;
+        let border = area.x + area.width.saturating_sub(1);
+        (border..=border + 1).contains(&column) && (area.y..area.y + area.height).contains(&row)
     }
 
     fn click_commit(&mut self, column: u16, row: u16) {
@@ -617,7 +640,8 @@ impl App {
     fn draw(&mut self, frame: &mut Frame) {
         let [header, main, footer] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
-        let list_width = (main.width * 2 / 5).clamp(30.min(main.width), 60);
+        self.main_area = main;
+        let list_width = clamp_list_width(self.list_width.unwrap_or((main.width * 2 / 5).min(60)), main.width);
         let [left, right] = Layout::horizontal([Constraint::Length(list_width), Constraint::Min(0)]).areas(main);
 
         self.draw_header(frame, header);
@@ -801,4 +825,10 @@ fn lines_needed(shown: usize, total: usize) -> usize {
 
 fn commits(count: usize) -> String {
     if count == 1 { "1 commit".into() } else { format!("{count} commits") }
+}
+
+// Keeps at least MIN_PANE_WIDTH columns for each pane, as far as the terminal allows.
+fn clamp_list_width(width: u16, total: u16) -> u16 {
+    let max = total.saturating_sub(MIN_PANE_WIDTH).max(MIN_PANE_WIDTH.min(total));
+    width.clamp(MIN_PANE_WIDTH.min(max), max)
 }

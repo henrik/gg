@@ -37,7 +37,7 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 | `P` | Push up to and including the selected commit |
 | `Q`, `Ctrl+C` | Quit |
 
-Pushes ask for confirmation in a modal and never force. gg captures the mouse, so hold Shift (Option in iTerm2) to select text.
+Pushes ask for confirmation in a modal and never force. Drag the vertical separator to resize the panes (each keeps at least 30 columns). gg captures the mouse, so hold Shift (Option in iTerm2) to select text.
 
 ### Rewriting safely alongside agents
 
