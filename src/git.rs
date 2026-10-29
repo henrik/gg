@@ -127,8 +127,19 @@ impl Repo {
         ["origin/main", "origin/master"].into_iter().find(|r| self.rev_parse(r).is_ok()).map(String::from)
     }
 
-    // What "pushed" is measured against: the branch's upstream, or else the default remote branch.
+    // A linked worktree (not the main checkout), whose branch is integrated straight into the default branch.
+    pub fn is_linked_worktree(&self) -> bool {
+        let dirs = self.run(&["rev-parse", "--absolute-git-dir", "--git-common-dir"]).unwrap_or_default();
+        let mut dirs = dirs.lines().map(|d| self.dir.join(d).canonicalize().ok());
+        let (git_dir, common_dir) = (dirs.next().flatten(), dirs.next().flatten());
+        git_dir.is_some() && git_dir != common_dir
+    }
+
+    // What "pushed" is measured against: the default remote branch in a linked worktree, else the branch's upstream, else the default remote branch.
     pub fn base_ref(&self) -> Option<String> {
+        if self.is_linked_worktree() {
+            return self.default_remote_branch();
+        }
         self.run(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
             .ok()
             .map(|s| s.trim().to_string())

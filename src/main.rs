@@ -32,6 +32,8 @@ const SELECTED_BG: Color = Color::Indexed(237);
 struct PendingPush {
     rev: String,
     remote: String,
+    // Set when pushing from a linked worktree, whose branch isn't what gets pushed to.
+    worktree_branch: Option<String>,
     branch: String,
     commits: Vec<String>,
 }
@@ -601,6 +603,7 @@ impl App {
         self.pending_push = Some(PendingPush {
             rev,
             remote: remote.to_string(),
+            worktree_branch: self.repo.is_linked_worktree().then(|| self.branch.clone().unwrap_or_else(|| "detached HEAD".into())),
             branch: branch.to_string(),
             commits: commits.lines().map(String::from).collect(),
         });
@@ -634,8 +637,10 @@ impl App {
         let Some(push) = &self.pending_push else { return };
         let area = frame.area();
         let shown = push.commits.len().min(area.height.saturating_sub(8) as usize);
-        let width = (push.commits.iter().map(|c| c.chars().count()).max().unwrap_or(0) as u16 + 4).clamp(44, area.width.saturating_sub(4).max(1));
-        let height = (lines_needed(shown, push.commits.len()) as u16).min(area.height);
+        let note = push.worktree_branch.as_ref().map(|b| format!("Worktree: pushes {b} straight to {}/{}", push.remote, push.branch));
+        let widest = push.commits.iter().chain(&note).map(|c| c.chars().count()).max().unwrap_or(0);
+        let width = (widest as u16 + 4).clamp(44, area.width.saturating_sub(4).max(1));
+        let height = (lines_needed(shown, push.commits.len()) as u16 + if note.is_some() { 2 } else { 0 }).min(area.height);
         let modal = ratatui::layout::Rect {
             x: area.x + (area.width.saturating_sub(width)) / 2,
             y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -643,15 +648,11 @@ impl App {
             height,
         };
 
-        let mut lines: Vec<Line> = push
-            .commits
-            .iter()
-            .take(shown)
-            .map(|c| {
-                let (hash, summary) = c.split_once(' ').unwrap_or((c, ""));
-                Line::from(vec![hash.to_string().yellow(), Span::raw(format!(" {summary}"))])
-            })
-            .collect();
+        let mut lines: Vec<Line> = note.into_iter().flat_map(|n| [Line::from(n).bold().yellow(), Line::raw("")]).collect();
+        lines.extend(push.commits.iter().take(shown).map(|c| {
+            let (hash, summary) = c.split_once(' ').unwrap_or((c, ""));
+            Line::from(vec![hash.to_string().yellow(), Span::raw(format!(" {summary}"))])
+        }));
         if shown < push.commits.len() {
             lines.push(Line::from(format!("…and {} more", push.commits.len() - shown)).fg(DIM));
         }

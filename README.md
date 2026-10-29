@@ -16,7 +16,7 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 
 ### Screen
 
-- Header: current branch, what it's compared against (its upstream, else `origin/main` or `origin/master`), commits ahead/behind, and a red banner while a rebase is in progress.
+- Header: current branch, what it's compared against (its upstream, else `origin/main` or `origin/master`; always the latter in a linked worktree), commits ahead/behind, and a red banner while a rebase is in progress.
 - Left: `UNSTAGED` (including untracked files) and `STAGED` entries at the top when there are such changes, showing who a commit would be by, then your unpushed commits, plus the 10 pushed commits below them, which are greyed out. Each shows short hash, date, author and co-authors, and summary. The upstream's position is labelled, e.g. `[origin/main]`. Newest is on top, and the oldest unpushed commit is selected at start.
 - Right: full message, stat and coloured diff, soft-wrapped. A cyan bar in the gutter marks the current hunk for `j`/`k`: the one you last jumped to while it's in view, else the last hunk in view.
 - The list refreshes by itself when HEAD, the upstream or uncommitted changes change (checked every second), keeping your selection, even if the selected commit was rewritten elsewhere.
@@ -38,7 +38,7 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 | `P` | Push up to and including the selected commit |
 | `Q`, `Ctrl+C` | Quit |
 
-Pushes ask for confirmation in a modal and never force. Drag the vertical separator to resize the panes (each keeps at least 30 columns). gg captures the mouse, so hold Shift (Option in iTerm2) to select text.
+Pushes ask for confirmation in a modal and never force. In a linked worktree (from `git worktree add`), the worktree's branch is treated as a local workspace for `origin/main`: its own upstream is ignored, and the push dialogue says it pushes straight to `origin/main`. Drag the vertical separator to resize the panes (each keeps at least 30 columns). gg captures the mouse, so hold Shift (Option in iTerm2) to select text.
 
 ### Rewriting safely alongside agents
 
