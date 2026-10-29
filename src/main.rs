@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 const PUSHED_COMMITS_SHOWN: usize = 10;
 const MIN_PANE_WIDTH: u16 = 30;
 const MOUSE_SCROLL_ROWS: usize = 3;
+const STALE_GRACE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DIM: Color = Color::DarkGray;
 const SELECTED_BG: Color = Color::Indexed(237);
@@ -56,6 +57,8 @@ struct App {
     // Set once the user drags the separator.
     list_width: Option<u16>,
     dragging_separator: bool,
+    // When each stale commit stopped being focused.
+    stale_unfocused_at: HashMap<String, Instant>,
     main_area: ratatui::layout::Rect,
     status: Option<(String, bool)>,
     pending_amend: Option<amend::Scratch>,
@@ -84,6 +87,7 @@ fn main() -> Result<()> {
         pending_push: None,
         list_width: None,
         dragging_separator: false,
+        stale_unfocused_at: HashMap::new(),
         main_area: ratatui::layout::Rect::default(),
         status: None,
         pending_amend: None,
@@ -168,9 +172,10 @@ impl App {
             if self.last_poll.elapsed() >= POLL_INTERVAL {
                 self.last_poll = Instant::now();
                 if self.current_fingerprint() != self.fingerprint {
-                    self.reload(None)?;
+                    self.reload_after_external_change()?;
                 }
             }
+            self.prune_stale();
         }
     }
 
@@ -184,7 +189,21 @@ impl App {
     }
 
     fn reload(&mut self, prefer: Option<&str>) -> Result<()> {
+        self.reload_with(prefer, false)
+    }
+
+    // If the focused commit disappeared, e.g. because an agent amended or reset it, it's kept and marked stale rather than jumping elsewhere.
+    fn reload_after_external_change(&mut self) -> Result<()> {
+        self.reload_with(None, true)
+    }
+
+    fn reload_with(&mut self, prefer: Option<&str>, keep_focused_as_stale: bool) -> Result<()> {
         let previous = self.commits.get(self.selected()).cloned();
+        let mut stale: Vec<(usize, Commit)> =
+            self.commits.iter().enumerate().filter(|(_, c)| c.stale).map(|(i, c)| (i, c.clone())).collect();
+        if keep_focused_as_stale && let Some(previous) = previous.as_ref().filter(|p| p.kind == Kind::Commit && !p.stale) {
+            stale.push((self.selected(), Commit { stale: true, ..previous.clone() }));
+        }
         let first_load = self.commits.is_empty();
 
         self.branch = self.repo.branch();
@@ -192,6 +211,13 @@ impl App {
         (self.ahead, self.behind) = self.base.as_deref().map(|b| self.repo.ahead_behind(b)).unwrap_or((0, 0));
         self.commits = self.repo.uncommitted();
         self.commits.extend(self.repo.commits(self.base.as_deref(), PUSHED_COMMITS_SHOWN)?);
+        stale.sort_by_key(|(index, _)| *index);
+        for (index, commit) in stale {
+            if !self.commits.iter().any(|c| c.hash == commit.hash) {
+                self.commits.insert(index.min(self.commits.len()), commit);
+            }
+        }
+        self.stale_unfocused_at.retain(|hash, _| self.commits.iter().any(|c| c.stale && c.hash == *hash));
         self.diffs.retain(|hash, _| !hash.starts_with("gg:"));
         if self.wrapped.as_ref().is_some_and(|(hash, _, _)| hash.starts_with("gg:")) {
             self.wrapped = None;
@@ -216,6 +242,33 @@ impl App {
             self.jumped_to_hunk = None;
         }
         Ok(())
+    }
+
+    // Drops stale commits that haven't been focused for a while.
+    fn prune_stale(&mut self) {
+        let selected = self.commits.get(self.selected()).map(|c| c.hash.clone());
+        let now = Instant::now();
+        for commit in self.commits.iter().filter(|c| c.stale) {
+            if Some(&commit.hash) == selected.as_ref() {
+                self.stale_unfocused_at.remove(&commit.hash);
+            } else {
+                self.stale_unfocused_at.entry(commit.hash.clone()).or_insert(now);
+            }
+        }
+
+        let expired = |c: &Commit| c.stale && self.stale_unfocused_at.get(&c.hash).is_some_and(|t| t.elapsed() >= STALE_GRACE);
+        if !self.commits.iter().any(expired) {
+            return;
+        }
+        let commits = std::mem::take(&mut self.commits);
+        let (expired, kept): (Vec<Commit>, Vec<Commit>) = commits.into_iter().partition(|c| expired(c));
+        self.commits = kept;
+        for commit in expired {
+            self.stale_unfocused_at.remove(&commit.hash);
+        }
+        if let Some(index) = selected.and_then(|hash| self.commits.iter().position(|c| c.hash == hash)) {
+            self.list.select(Some(index));
+        }
     }
 
     fn selected(&self) -> usize {
@@ -391,6 +444,10 @@ impl App {
         let commit = self.selected_commit().cloned()?;
         if commit.kind != Kind::Commit {
             self.set_status(format!("{} changes aren't a commit", commit.short), true);
+            return None;
+        }
+        if commit.stale {
+            self.set_status(format!("{} is no longer on this branch", commit.short), true);
             return None;
         }
         Some(commit)
@@ -710,8 +767,13 @@ impl App {
                     return ListItem::new(vec![first, second]);
                 }
 
-                let style = |color: Color| Style::new().fg(if c.pushed { DIM } else { color });
-                let first = Line::from(vec![
+                let style = |color: Color| Style::new().fg(if c.pushed || c.stale { DIM } else { color });
+                let mut first = vec![];
+                if c.stale {
+                    first.push(Span::styled(" STALE ", Style::new().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)));
+                    first.push(Span::raw(" "));
+                }
+                first.extend([
                     Span::styled(c.short.clone(), style(Color::Yellow)),
                     Span::raw(" "),
                     Span::styled(c.date.clone(), style(Color::Blue)),
@@ -725,8 +787,9 @@ impl App {
                     second.push(Span::styled(format!("[{base}]"), Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
                     second.push(Span::raw(" "));
                 }
-                second.push(Span::styled(c.summary.clone(), style(Color::Reset)));
-                ListItem::new(vec![first, Line::from(second)])
+                let summary_style = if c.stale { style(Color::Reset).add_modifier(Modifier::CROSSED_OUT) } else { style(Color::Reset) };
+                second.push(Span::styled(c.summary.clone(), summary_style));
+                ListItem::new(vec![Line::from(first), Line::from(second)])
             })
             .collect();
 

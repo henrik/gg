@@ -27,6 +27,8 @@ pub struct Commit {
     pub authors: Vec<String>,
     pub summary: String,
     pub pushed: bool,
+    // No longer on the branch, but kept around while focused.
+    pub stale: bool,
 }
 
 impl Commit {
@@ -40,6 +42,7 @@ impl Commit {
             authors: authors.to_vec(),
             summary,
             pushed: false,
+            stale: false,
         }
     }
 }
@@ -169,6 +172,7 @@ impl Repo {
                     authors,
                     summary: f[4].to_string(),
                     pushed: base.is_some() && !unpushed.contains(f[0]),
+                    stale: false,
                 }
             })
             .collect())
