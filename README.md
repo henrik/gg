@@ -30,6 +30,7 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 | `PgUp`/`PgDn`, mouse wheel | Scroll diff |
 | `Home`/`End` | Jump to top/bottom of diff |
 | `j`/`k` | Next/previous hunk |
+| `w` | Toggle hiding whitespace changes in diffs (like `git diff -w`) |
 | `r` | Reword (and optionally edit the diff) |
 | `a` | Amend the commit's files |
 | `A` | Blocking amend, via an interactive rebase |

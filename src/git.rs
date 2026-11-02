@@ -285,12 +285,13 @@ impl Repo {
         out
     }
 
-    pub fn show_entry(&self, entry: &Commit) -> Result<Vec<u8>> {
+    pub fn show_entry(&self, entry: &Commit, ignore_whitespace: bool) -> Result<Vec<u8>> {
+        let whitespace: &[&str] = if ignore_whitespace { &["--ignore-all-space"] } else { &[] };
         match entry.kind {
-            Kind::Commit => self.show(&entry.hash),
-            Kind::Staged => self.run_bytes(&["diff", "--cached", "--color=always", "--stat", "--patch"], None),
+            Kind::Commit => self.show(&entry.hash, whitespace),
+            Kind::Staged => self.run_bytes(&[&["diff", "--cached", "--color=always", "--stat", "--patch"], whitespace].concat(), None),
             Kind::Unstaged => {
-                let mut out = self.run_bytes(&["diff", "--color=always", "--stat", "--patch"], None)?;
+                let mut out = self.run_bytes(&[&["diff", "--color=always", "--stat", "--patch"], whitespace].concat(), None)?;
                 let untracked = self.untracked();
                 for path in untracked.iter().take(MAX_UNTRACKED_DIFFS) {
                     // Exits with 1 when there are differences, which there always are.
@@ -306,18 +307,9 @@ impl Repo {
         }
     }
 
-    pub fn show(&self, hash: &str) -> Result<Vec<u8>> {
-        self.run_bytes(
-            &[
-                "show",
-                "--color=always",
-                "--stat",
-                "--patch",
-                "--format=%C(yellow)commit %H%C(reset)%nAuthor: %an <%ae>%nDate:   %ad%n%n%B",
-                hash,
-            ],
-            None,
-        )
+    fn show(&self, hash: &str, extra_args: &[&str]) -> Result<Vec<u8>> {
+        let format = "--format=%C(yellow)commit %H%C(reset)%nAuthor: %an <%ae>%nDate:   %ad%n%n%B";
+        self.run_bytes(&[&["show", "--color=always", "--stat", "--patch", format], extra_args, &[hash]].concat(), None)
     }
 
     pub fn message(&self, hash: &str) -> Result<String> {

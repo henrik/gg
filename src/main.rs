@@ -63,6 +63,7 @@ struct App {
     // Row ranges (end exclusive) of the wrapped diff's hunks.
     hunks: Vec<(usize, usize)>,
     jumped_to_hunk: Option<usize>,
+    ignore_whitespace: bool,
     commits_area: ratatui::layout::Rect,
     pending_push: Option<PendingPush>,
     // Set once the user drags the separator.
@@ -101,6 +102,7 @@ fn main() -> Result<()> {
         wrapped: None,
         hunks: vec![],
         jumped_to_hunk: None,
+        ignore_whitespace: false,
         commits_area: ratatui::layout::Rect::default(),
         pending_push: None,
         list_width: None,
@@ -202,6 +204,7 @@ impl App {
             KeyCode::End => self.diff_scroll = self.max_scroll(),
             KeyCode::Char('j') => self.jump_to_hunk(true),
             KeyCode::Char('k') => self.jump_to_hunk(false),
+            KeyCode::Char('w') => self.toggle_whitespace(),
             KeyCode::Char('r') => self.reword(terminal)?,
             KeyCode::Char('b') => self.rebase(terminal)?,
             KeyCode::Char('p') => self.confirm_push(terminal, "HEAD".into())?,
@@ -376,7 +379,7 @@ impl App {
         let entry = self.selected_commit()?.clone();
         let hash = entry.hash.clone();
         if !self.diffs.contains_key(&hash) {
-            let text = match self.repo.show_entry(&entry) {
+            let text = match self.repo.show_entry(&entry, self.ignore_whitespace) {
                 Ok(bytes) => {
                     let bytes = String::from_utf8_lossy(&bytes).replace('\t', "    ");
                     bytes.into_bytes().into_text().unwrap_or_else(|e| Text::raw(e.to_string()))
@@ -420,6 +423,14 @@ impl App {
             self.jumped_to_hunk = Some(index);
             self.diff_scroll = self.hunks[index].0.min(self.max_scroll());
         }
+    }
+
+    fn toggle_whitespace(&mut self) {
+        self.ignore_whitespace = !self.ignore_whitespace;
+        self.diffs.clear();
+        self.wrapped = None;
+        self.jumped_to_hunk = None;
+        self.diff_scroll = 0;
     }
 
     fn max_scroll(&mut self) -> usize {
@@ -819,6 +830,7 @@ impl App {
             ("PgUp/PgDn", "scroll"),
             ("Home/End", "top/end"),
             ("j/k", "hunk"),
+            ("w", if self.ignore_whitespace { "show whitespace" } else { "hide whitespace" }),
             ("r", "reword"),
             ("a", "amend"),
             ("A", "blocking amend"),
@@ -842,6 +854,9 @@ impl App {
         ];
         if self.rebase_in_progress {
             spans.push(Span::raw(" REBASE IN PROGRESS ").bold().white().on_red());
+        }
+        if self.ignore_whitespace {
+            spans.push(Span::raw(" HIDING WHITESPACE CHANGES ").bold().black().on_yellow());
         }
         if let Some(base) = &self.base {
             spans.push(Span::raw(format!(" ⇄ {base} ")).fg(DIM));
