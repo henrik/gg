@@ -25,7 +25,7 @@ const PUSHED_COMMITS_SHOWN: usize = 10;
 const MIN_PANE_WIDTH: u16 = 30;
 const MOUSE_SCROLL_ROWS: usize = 3;
 const STALE_GRACE: Duration = Duration::from_secs(2);
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
+const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const FETCH_INTERVAL: Duration = Duration::from_secs(120);
 const DIM: Color = Color::DarkGray;
 const SELECTED_BG: Color = Color::Indexed(237);
@@ -74,7 +74,9 @@ struct App {
     status: Option<(String, bool)>,
     pending_amend: Option<amend::Scratch>,
     fingerprint: String,
-    last_poll: Instant,
+    // Cached, since they're needed on every redraw.
+    rebase_in_progress: bool,
+    base_hash: Option<String>,
     fetch: Option<std::process::Child>,
     last_fetch: Option<Instant>,
     fetch_failed: bool,
@@ -108,7 +110,8 @@ fn main() -> Result<()> {
         status: None,
         pending_amend: None,
         fingerprint: String::new(),
-        last_poll: Instant::now(),
+        rebase_in_progress: false,
+        base_hash: None,
         fetch: None,
         last_fetch: None,
         fetch_failed: false,
@@ -126,80 +129,92 @@ fn main() -> Result<()> {
 
 impl App {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let changes = watch_for_changes(self.repo.clone());
         loop {
             terminal.draw(|f| self.draw(f))?;
 
+            // Handles everything that's queued before redrawing, so bursts of scroll or mouse-move events can't pile up.
             if event::poll(Duration::from_millis(250))? {
-                let key = match event::read()? {
-                    Event::Key(key) => key,
-                    Event::Mouse(_) if self.pending_push.is_some() => continue,
-                    Event::Mouse(mouse) => {
-                        match mouse.kind {
-                            MouseEventKind::ScrollDown => self.diff_scroll = (self.diff_scroll + MOUSE_SCROLL_ROWS).min(self.max_scroll()),
-                            MouseEventKind::ScrollUp => self.diff_scroll = self.diff_scroll.saturating_sub(MOUSE_SCROLL_ROWS),
-                            MouseEventKind::Down(MouseButton::Left) if self.on_separator(mouse.column, mouse.row) => {
-                                self.dragging_separator = true;
-                            }
-                            MouseEventKind::Down(MouseButton::Left) => self.click_commit(mouse.column, mouse.row),
-                            MouseEventKind::Drag(MouseButton::Left) if self.dragging_separator => {
-                                let main = self.main_area;
-                                self.list_width = Some(clamp_list_width(mouse.column.saturating_sub(main.x) + 1, main.width));
-                            }
-                            MouseEventKind::Up(MouseButton::Left) => self.dragging_separator = false,
-                            _ => {}
-                        }
-                        continue;
+                loop {
+                    if self.handle_event(event::read()?, terminal)? {
+                        return Ok(());
                     }
-                    _ => continue,
-                };
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-
-                self.status = None;
-                if self.pending_push.is_some() {
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Enter => self.push(terminal)?,
-                        _ => self.pending_push = None,
+                    if !event::poll(Duration::ZERO)? {
+                        break;
                     }
-                    continue;
-                }
-
-                let page = self.diff_height.saturating_sub(2).max(1);
-                match key.code {
-                    KeyCode::Char('Q') => return Ok(()),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
-                    KeyCode::Up => self.select(self.selected().saturating_sub(1)),
-                    KeyCode::Down => self.select(self.selected() + 1),
-                    KeyCode::PageUp => self.diff_scroll = self.diff_scroll.saturating_sub(page),
-                    KeyCode::PageDown => self.diff_scroll = (self.diff_scroll + page).min(self.max_scroll()),
-                    KeyCode::Home => self.diff_scroll = 0,
-                    KeyCode::End => self.diff_scroll = self.max_scroll(),
-                    KeyCode::Char('j') => self.jump_to_hunk(true),
-                    KeyCode::Char('k') => self.jump_to_hunk(false),
-                    KeyCode::Char('r') => self.reword(terminal)?,
-                    KeyCode::Char('b') => self.rebase(terminal)?,
-                    KeyCode::Char('p') => self.confirm_push(terminal, "HEAD".into())?,
-                    KeyCode::Char('P') => {
-                        if let Some(commit) = self.selected_real_commit() {
-                            self.confirm_push(terminal, commit.hash)?;
-                        }
-                    }
-                    KeyCode::Char('a') => self.amend(terminal)?,
-                    KeyCode::Char('A') => self.blocking_amend(terminal)?,
-                    _ => {}
                 }
             }
 
-            if self.last_poll.elapsed() >= POLL_INTERVAL {
-                self.last_poll = Instant::now();
-                if self.current_fingerprint() != self.fingerprint {
-                    self.reload_after_external_change()?;
-                }
+            if changes.try_iter().last().is_some_and(|fingerprint| fingerprint != self.fingerprint) {
+                self.reload_after_external_change()?;
             }
             self.prune_stale();
             self.background_fetch();
         }
+    }
+
+    // Returns true to quit.
+    fn handle_event(&mut self, event: Event, terminal: &mut DefaultTerminal) -> Result<bool> {
+        let key = match event {
+            Event::Key(key) => key,
+            Event::Mouse(_) if self.pending_push.is_some() => return Ok(false),
+            Event::Mouse(mouse) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollDown => self.diff_scroll = (self.diff_scroll + MOUSE_SCROLL_ROWS).min(self.max_scroll()),
+                    MouseEventKind::ScrollUp => self.diff_scroll = self.diff_scroll.saturating_sub(MOUSE_SCROLL_ROWS),
+                    MouseEventKind::Down(MouseButton::Left) if self.on_separator(mouse.column, mouse.row) => {
+                        self.dragging_separator = true;
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => self.click_commit(mouse.column, mouse.row),
+                    MouseEventKind::Drag(MouseButton::Left) if self.dragging_separator => {
+                        let main = self.main_area;
+                        self.list_width = Some(clamp_list_width(mouse.column.saturating_sub(main.x) + 1, main.width));
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => self.dragging_separator = false,
+                    _ => {}
+                }
+                return Ok(false);
+            }
+            _ => return Ok(false),
+        };
+        if key.kind != KeyEventKind::Press {
+            return Ok(false);
+        }
+
+        self.status = None;
+        if self.pending_push.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => self.push(terminal)?,
+                _ => self.pending_push = None,
+            }
+            return Ok(false);
+        }
+
+        let page = self.diff_height.saturating_sub(2).max(1);
+        match key.code {
+            KeyCode::Char('Q') => return Ok(true),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
+            KeyCode::Up => self.select(self.selected().saturating_sub(1)),
+            KeyCode::Down => self.select(self.selected() + 1),
+            KeyCode::PageUp => self.diff_scroll = self.diff_scroll.saturating_sub(page),
+            KeyCode::PageDown => self.diff_scroll = (self.diff_scroll + page).min(self.max_scroll()),
+            KeyCode::Home => self.diff_scroll = 0,
+            KeyCode::End => self.diff_scroll = self.max_scroll(),
+            KeyCode::Char('j') => self.jump_to_hunk(true),
+            KeyCode::Char('k') => self.jump_to_hunk(false),
+            KeyCode::Char('r') => self.reword(terminal)?,
+            KeyCode::Char('b') => self.rebase(terminal)?,
+            KeyCode::Char('p') => self.confirm_push(terminal, "HEAD".into())?,
+            KeyCode::Char('P') => {
+                if let Some(commit) = self.selected_real_commit() {
+                    self.confirm_push(terminal, commit.hash)?;
+                }
+            }
+            KeyCode::Char('a') => self.amend(terminal)?,
+            KeyCode::Char('A') => self.blocking_amend(terminal)?,
+            _ => {}
+        }
+        Ok(false)
     }
 
     // Keeps the remote branches fresh, so the header shows how far behind we are.
@@ -231,15 +246,6 @@ impl App {
         self.fetch_failed = !status.is_some_and(|s| s.success());
         self.status = None;
         Ok(!self.fetch_failed)
-    }
-
-    fn current_fingerprint(&self) -> String {
-        let mut out = self.repo.run(&["rev-parse", "--symbolic-full-name", "HEAD"]).unwrap_or_default();
-        out += &self.repo.run(&["rev-parse", "HEAD"]).unwrap_or_default();
-        for rev in self.base.iter().chain(&self.target) {
-            out += &self.repo.run(&["rev-parse", rev]).unwrap_or_default();
-        }
-        out + &self.repo.worktree_fingerprint()
     }
 
     fn reload(&mut self, prefer: Option<&str>) -> Result<()> {
@@ -278,7 +284,9 @@ impl App {
         if self.wrapped.as_ref().is_some_and(|(hash, _, _)| hash.starts_with("gg:")) {
             self.wrapped = None;
         }
-        self.fingerprint = self.current_fingerprint();
+        self.fingerprint = self.repo.fingerprint();
+        self.rebase_in_progress = self.repo.rebase_in_progress();
+        self.base_hash = self.base.as_deref().and_then(|b| self.repo.rev_parse(b).ok());
 
         let find = |hash: &str| self.commits.iter().position(|c| c.hash == hash);
 
@@ -832,7 +840,7 @@ impl App {
             Span::raw(" "),
             Span::raw(self.branch.as_deref().unwrap_or("(detached HEAD)")).bold().magenta(),
         ];
-        if self.repo.rebase_in_progress() {
+        if self.rebase_in_progress {
             spans.push(Span::raw(" REBASE IN PROGRESS ").bold().white().on_red());
         }
         if let Some(base) = &self.base {
@@ -861,7 +869,7 @@ impl App {
 
     fn draw_commits(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
         self.commits_area = area;
-        let base_hash = self.base.as_deref().and_then(|b| self.repo.rev_parse(b).ok());
+        let base_hash = self.base_hash.clone();
         let items: Vec<ListItem> = self
             .commits
             .iter()
@@ -928,6 +936,17 @@ impl App {
             frame.render_widget(Paragraph::new(marker), gutter);
         }
     }
+}
+
+// Sends the repo's fingerprint every so often, computed in the background since `git status` can be slow in big repos.
+fn watch_for_changes(repo: Repo) -> std::sync::mpsc::Receiver<String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        while sender.send(repo.fingerprint()).is_ok() {
+            std::thread::sleep(WATCH_INTERVAL);
+        }
+    });
+    receiver
 }
 
 fn pause(message: &str) -> String {

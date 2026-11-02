@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 
 const MAX_UNTRACKED_DIFFS: usize = 50;
 
+#[derive(Clone)]
 pub struct Repo {
     pub dir: PathBuf,
 }
@@ -57,6 +58,8 @@ impl Repo {
     pub fn command(&self) -> Command {
         let mut cmd = Command::new("git");
         cmd.current_dir(&self.dir);
+        // So our frequent `git status` never takes the index lock, which would make others' git commands fail.
+        cmd.env("GIT_OPTIONAL_LOCKS", "0");
         cmd
     }
 
@@ -254,6 +257,17 @@ impl Repo {
     fn untracked(&self) -> Vec<String> {
         let out = self.run_bytes(&["ls-files", "--others", "--exclude-standard", "-z"], None).unwrap_or_default();
         String::from_utf8_lossy(&out).split('\0').filter(|p| !p.is_empty()).map(String::from).collect()
+    }
+
+    // Changes whenever anything gg shows might have changed: HEAD, the base, the default remote branch, a rebase starting or stopping, or uncommitted changes.
+    pub fn fingerprint(&self) -> String {
+        let mut out = self.run(&["rev-parse", "--symbolic-full-name", "HEAD"]).unwrap_or_default();
+        out += &self.run(&["rev-parse", "HEAD"]).unwrap_or_default();
+        for rev in self.base_ref().iter().chain(&self.default_remote_branch()) {
+            out += &self.run(&["rev-parse", rev]).unwrap_or_default();
+        }
+        out += &self.rebase_in_progress().to_string();
+        out + &self.worktree_fingerprint()
     }
 
     // Changes in status, file contents or the index, for noticing uncommitted changes.
