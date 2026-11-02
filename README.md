@@ -16,7 +16,7 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 
 ### Screen
 
-- Header: current branch, what it's compared against (its upstream, else `origin/main` or `origin/master`; always the latter in a linked worktree), commits ahead/behind, and a red banner while a rebase is in progress.
+- Header: current branch, what it's compared against (its upstream, else `origin/main` or `origin/master`; always the latter in a linked worktree), commits ahead/behind, how far behind `origin/main` you are if that's not what it's compared against, and a red banner while a rebase is in progress. gg fetches `origin/main` (and the upstream) in the background every 2 minutes, never prompting for credentials, and says so in the header if fetching fails.
 - Left: `UNSTAGED` (including untracked files) and `STAGED` entries at the top when there are such changes, showing who a commit would be by, then your unpushed commits, plus the 10 pushed commits below them, which are greyed out. Each shows short hash, date, author and co-authors, and summary. The upstream's position is labelled, e.g. `[origin/main]`. Newest is on top, and the oldest unpushed commit is selected at start.
 - Right: full message, stat and coloured diff, soft-wrapped. A cyan bar in the gutter marks the current hunk for `j`/`k`: the one you last jumped to while it's in view, else the last hunk in view.
 - The list refreshes by itself when HEAD, the upstream or uncommitted changes change (checked every second), keeping your selection, even if the selected commit was rewritten elsewhere.
@@ -33,12 +33,12 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 | `r` | Reword (and optionally edit the diff) |
 | `a` | Amend the commit's files |
 | `A` | Blocking amend, via an interactive rebase |
-| `b` | Fetch and rebase onto `origin/main` (or `origin/master`), autostashing |
+| `b` | Fetch and rebase onto `origin/main` (or `origin/master`) |
 | `p` | Push all commits to that branch |
 | `P` | Push up to and including the selected commit |
 | `Q`, `Ctrl+C` | Quit |
 
-Pushes ask for confirmation in a modal and never force. In a linked worktree (from `git worktree add`), the worktree's branch is treated as a local workspace for `origin/main`: its own upstream is ignored, and the push dialogue says it pushes straight to `origin/main`. Drag the vertical separator to resize the panes (each keeps at least 30 columns). gg captures the mouse, so hold Shift (Option in iTerm2) to select text.
+Pushes fetch first, then ask for confirmation in a modal, and never force. If `origin/main` has moved on, the modal says so and confirming rebases onto it before pushing; if that rebase would conflict, nothing changes and nothing is pushed. In a linked worktree (from `git worktree add`), the worktree's branch is treated as a local workspace for `origin/main`: its own upstream is ignored, and the push dialogue says it pushes straight to `origin/main`. Drag the vertical separator to resize the panes (each keeps at least 30 columns). gg captures the mouse, so hold Shift (Option in iTerm2) to select text.
 
 ### Rewriting safely alongside agents
 
@@ -47,6 +47,8 @@ Pushes ask for confirmation in a modal and never force. In a linked worktree (fr
 `a` opens the files the commit adds or modifies in Vim tabs, each scrolled to its first change.
 
 In `r`, the commit's diff appears below the scissors line, as with `git commit -v`. Editing it amends the commit's code, like `git add -e`. The edited diff is applied to the commit's parent, and if it doesn't apply cleanly nothing changes.
+
+`b` and the rebase before pushing are done the same way: your unpushed commits are replayed onto `origin/main` in memory and HEAD is moved with a compare-and-swap, so there's no stash and no rebase in progress for agents to trip over, and uncommitted changes are kept. Commits whose changes are already upstream are dropped. If that fails (a conflict, or uncommitted changes in the way), `b` falls back to a real `git rebase --autostash` in the terminal.
 
 `A` instead stops an interactive rebase at the commit and opens its files in the real repo, so agents can see a rebase is in progress. When you quit Vim it offers to amend and continue, abort, or leave the rebase in progress.
 

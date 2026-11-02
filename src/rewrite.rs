@@ -5,7 +5,7 @@
 //! When the replay changes HEAD's tree, the index and working tree are updated with a two-way `read-tree -m -u` while holding the index lock, so nobody can commit in between, and uncommitted changes to unrelated files are kept.
 
 use crate::git::Repo;
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -45,17 +45,52 @@ pub fn rewrite(repo: &Repo, target: &str, change: Change, base: Option<&str>) ->
         )?;
         let new_head = replay(repo, target, &new_target, &head)?;
 
-        let moved = if tree(repo, &head)? == tree(repo, &new_head)? {
-            update_head(repo, &head, &new_head, short)
-        } else {
-            update_head_and_worktree(repo, &head, &new_head, short)?
-        };
-        if moved {
+        if move_head(repo, &head, &new_head, &format!("gg: rewrite {short}"))? {
             return Ok(new_target);
         }
     }
 
     bail!("HEAD kept moving; gave up after {MAX_ATTEMPTS} attempts")
+}
+
+// Like `git rebase onto`, but in memory and moving HEAD as `rewrite` does, so there's no stash or half-done rebase for anyone to trip over. Commits whose changes are already in `onto` are dropped. Returns the new hash of each replayed commit (or for a dropped one, of what took its place).
+pub fn rebase(repo: &Repo, onto: &str) -> Result<HashMap<String, String>> {
+    let onto_hash = repo.rev_parse(onto)?;
+
+    for _ in 0..MAX_ATTEMPTS {
+        let head = repo.rev_parse("HEAD")?;
+        if repo.is_ancestor(&onto_hash, &head) {
+            return Ok(HashMap::new());
+        }
+
+        let committer = repo.run(&["var", "GIT_COMMITTER_IDENT"])?;
+        let mut mapping = HashMap::new();
+        let mut new_head = onto_hash.clone();
+        for commit in repo.run(&["rev-list", "--reverse", "--topo-order", &format!("{onto_hash}..{head}")])?.lines() {
+            let [old_parent] = parents(repo, commit)?.try_into().map_err(|_| anyhow!("Can't rebase merge commit {}", &commit[..7]))?;
+            let new_tree = cherry_pick_tree(repo, commit, &old_parent, &new_head)?;
+            let became_empty = new_tree == tree(repo, &new_head)? && tree(repo, &old_parent)? != tree(repo, commit)?;
+            if !became_empty {
+                new_head = write_commit(repo, commit, std::slice::from_ref(&new_head), Some(&new_tree), Some(committer.trim()), None)?;
+            }
+            mapping.insert(commit.to_string(), new_head.clone());
+        }
+
+        if move_head(repo, &head, &new_head, &format!("gg: rebase onto {onto}"))? {
+            return Ok(mapping);
+        }
+    }
+
+    bail!("HEAD kept moving; gave up after {MAX_ATTEMPTS} attempts")
+}
+
+// Returns false if HEAD moved in the meantime, meaning we should try again.
+fn move_head(repo: &Repo, old: &str, new: &str, message: &str) -> Result<bool> {
+    if tree(repo, old)? == tree(repo, new)? {
+        Ok(update_head(repo, old, new, message))
+    } else {
+        update_head_and_worktree(repo, old, new, message)
+    }
 }
 
 // Recreates the commits in old_target..head on top of new_target. Returns the new head.
@@ -99,18 +134,17 @@ fn cherry_pick_tree(repo: &Repo, commit: &str, old_parent: &str, new_parent: &st
         Some(0) => Ok(tree),
         Some(1) => {
             let files: Vec<&str> = lines.take_while(|l| !l.is_empty()).collect();
-            bail!("Conflicts with later commit {} in {}", &commit[..7], files.join(", "))
+            bail!("{} would conflict in {}", &commit[..7], files.join(", "))
         }
         _ => bail!("git merge-tree failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
     }
 }
 
-fn update_head(repo: &Repo, old: &str, new: &str, short: &str) -> bool {
-    repo.ok(&["update-ref", "-m", &format!("gg: rewrite {short}"), "HEAD", new, old])
+fn update_head(repo: &Repo, old: &str, new: &str, message: &str) -> bool {
+    repo.ok(&["update-ref", "-m", message, "HEAD", new, old])
 }
 
-// Returns false if HEAD moved before we got the lock, meaning we should try again.
-fn update_head_and_worktree(repo: &Repo, old: &str, new: &str, short: &str) -> Result<bool> {
+fn update_head_and_worktree(repo: &Repo, old: &str, new: &str, message: &str) -> Result<bool> {
     let index = repo.git_path("index")?;
     let _lock = IndexLock::acquire(&index)?;
     if repo.rev_parse("HEAD")? != old {
@@ -127,7 +161,7 @@ fn update_head_and_worktree(repo: &Repo, old: &str, new: &str, short: &str) -> R
         bail!("Uncommitted changes are in the way: {e}");
     }
 
-    if !update_head(repo, old, new, short) {
+    if !update_head(repo, old, new, message) {
         repo.run_with_index(&scratch, &["read-tree", "-m", "-u", new, old])?;
         std::fs::remove_file(&scratch)?;
         return Ok(false);
@@ -309,7 +343,7 @@ mod tests {
         let new_tree = tree_with(&repo, &target, "f", "uno\n");
         let error = rewrite(&repo, &target, Change { tree: Some(&new_tree), ..Default::default() }, None).unwrap_err();
 
-        assert!(error.to_string().contains("Conflicts with later commit"), "{error}");
+        assert!(error.to_string().contains("would conflict in f"), "{error}");
         assert_eq!(repo.rev_parse("HEAD").unwrap(), head);
         assert_eq!(read(&repo, "f"), "two\n");
     }
@@ -349,5 +383,46 @@ mod tests {
 
         let change = Change { message: Some("A reworded\n"), ..Default::default() };
         assert!(rewrite(&repo, &target, change, Some("origin/main")).is_err());
+    }
+
+    #[test]
+    fn rebases_onto_upstream_keeping_uncommitted_changes_and_dropping_commits_already_upstream() {
+        let repo = repo("rebase");
+        let base = commit(&repo, "a", "a", "A");
+        commit(&repo, "b", "b", "B");
+        let mine = commit(&repo, "c", "c", "C");
+        let head = commit(&repo, "d", "d", "D");
+
+        repo.run(&["checkout", "-q", &base]).unwrap();
+        commit(&repo, "c", "c", "C upstream");
+        let upstream = commit(&repo, "e", "e", "E upstream");
+        repo.run(&["update-ref", "refs/remotes/origin/main", &upstream]).unwrap();
+        repo.run(&["checkout", "-q", "-B", "main", &head]).unwrap();
+        std::fs::write(repo.dir.join("a"), "uncommitted").unwrap();
+
+        let mapping = rebase(&repo, "origin/main").unwrap();
+
+        assert_eq!(log(&repo), "D\nB\nE upstream\nC upstream\nA\n");
+        assert_eq!(mapping[&mine], repo.rev_parse("HEAD~").unwrap());
+        assert_eq!(read(&repo, "e"), "e");
+        assert_eq!(read(&repo, "a"), "uncommitted");
+        assert_eq!(repo.run(&["status", "--porcelain"]).unwrap(), " M a\n");
+    }
+
+    #[test]
+    fn refuses_rebase_that_conflicts() {
+        let repo = repo("rebase-conflict");
+        let base = commit(&repo, "f", "one\n", "A");
+        let head = commit(&repo, "f", "two\n", "B");
+        repo.run(&["checkout", "-q", &base]).unwrap();
+        let upstream = commit(&repo, "f", "uno\n", "A upstream");
+        repo.run(&["update-ref", "refs/remotes/origin/main", &upstream]).unwrap();
+        repo.run(&["checkout", "-q", "-B", "main", &head]).unwrap();
+
+        let error = rebase(&repo, "origin/main").unwrap_err();
+
+        assert!(error.to_string().contains("would conflict in f"), "{error}");
+        assert_eq!(repo.rev_parse("HEAD").unwrap(), head);
+        assert_eq!(read(&repo, "f"), "two\n");
     }
 }

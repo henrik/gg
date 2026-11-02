@@ -147,6 +147,26 @@ impl Repo {
             .or_else(|| self.default_remote_branch())
     }
 
+    // Fetches the default remote branch (and the upstream, if on the same remote) without ever prompting, so it can run in the background.
+    pub fn fetch_command(&self) -> Option<Command> {
+        let default = self.default_remote_branch()?;
+        let (remote, branch) = default.split_once('/')?;
+        let mut branches = vec![branch.to_string()];
+        if let Some(upstream) = self.base_ref().and_then(|b| b.strip_prefix(&format!("{remote}/")).map(String::from))
+            && upstream != branch
+        {
+            branches.push(upstream);
+        }
+
+        let mut cmd = self.command();
+        cmd.args(["fetch", "--quiet", remote]).args(&branches);
+        cmd.env("GIT_TERMINAL_PROMPT", "0").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        if std::env::var_os("GIT_SSH_COMMAND").is_none() && !self.ok(&["config", "core.sshCommand"]) {
+            cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+        }
+        Some(cmd)
+    }
+
     pub fn ahead_behind(&self, base: &str) -> (usize, usize) {
         let out = self.run(&["rev-list", "--left-right", "--count", &format!("HEAD...{base}")]).unwrap_or_default();
         let mut parts = out.split_whitespace().map(|n| n.parse().unwrap_or(0));

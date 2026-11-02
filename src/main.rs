@@ -26,16 +26,22 @@ const MIN_PANE_WIDTH: u16 = 30;
 const MOUSE_SCROLL_ROWS: usize = 3;
 const STALE_GRACE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+const FETCH_INTERVAL: Duration = Duration::from_secs(120);
 const DIM: Color = Color::DarkGray;
 const SELECTED_BG: Color = Color::Indexed(237);
 
 struct PendingPush {
     rev: String,
+    // E.g. "origin/main", which is `remote`/`branch`.
+    onto: String,
     remote: String,
     // Set when pushing from a linked worktree, whose branch isn't what gets pushed to.
     worktree_branch: Option<String>,
     branch: String,
     commits: Vec<String>,
+    // Commits on `onto` that we don't have yet, so we must rebase before pushing.
+    behind: usize,
+    fetch_failed: bool,
 }
 
 struct App {
@@ -44,6 +50,9 @@ struct App {
     base: Option<String>,
     ahead: usize,
     behind: usize,
+    // Where pushes go and `b` rebases onto, e.g. "origin/main", and how far behind it HEAD is.
+    target: Option<String>,
+    behind_target: usize,
     commits: Vec<Commit>,
     list: ListState,
     diffs: HashMap<String, Text<'static>>,
@@ -66,6 +75,9 @@ struct App {
     pending_amend: Option<amend::Scratch>,
     fingerprint: String,
     last_poll: Instant,
+    fetch: Option<std::process::Child>,
+    last_fetch: Option<Instant>,
+    fetch_failed: bool,
 }
 
 fn main() -> Result<()> {
@@ -76,6 +88,8 @@ fn main() -> Result<()> {
         base: None,
         ahead: 0,
         behind: 0,
+        target: None,
+        behind_target: 0,
         commits: vec![],
         list: ListState::default(),
         diffs: HashMap::new(),
@@ -95,12 +109,18 @@ fn main() -> Result<()> {
         pending_amend: None,
         fingerprint: String::new(),
         last_poll: Instant::now(),
+        fetch: None,
+        last_fetch: None,
+        fetch_failed: false,
     };
     app.reload(None)?;
 
     let mut terminal = init_terminal();
     let result = app.run(&mut terminal);
     restore_terminal();
+    if let Some(mut fetch) = app.fetch.take() {
+        let _ = fetch.kill();
+    }
     result
 }
 
@@ -159,10 +179,10 @@ impl App {
                     KeyCode::Char('k') => self.jump_to_hunk(false),
                     KeyCode::Char('r') => self.reword(terminal)?,
                     KeyCode::Char('b') => self.rebase(terminal)?,
-                    KeyCode::Char('p') => self.confirm_push("HEAD".into()),
+                    KeyCode::Char('p') => self.confirm_push(terminal, "HEAD".into())?,
                     KeyCode::Char('P') => {
                         if let Some(commit) = self.selected_real_commit() {
-                            self.confirm_push(commit.hash);
+                            self.confirm_push(terminal, commit.hash)?;
                         }
                     }
                     KeyCode::Char('a') => self.amend(terminal)?,
@@ -178,14 +198,46 @@ impl App {
                 }
             }
             self.prune_stale();
+            self.background_fetch();
         }
+    }
+
+    // Keeps the remote branches fresh, so the header shows how far behind we are.
+    fn background_fetch(&mut self) {
+        if let Some(fetch) = &mut self.fetch {
+            match fetch.try_wait() {
+                Ok(None) => return,
+                result => self.fetch_failed = !result.is_ok_and(|s| s.is_some_and(|s| s.success())),
+            }
+            self.fetch = None;
+        }
+        if self.last_fetch.is_none_or(|t| t.elapsed() >= FETCH_INTERVAL) {
+            self.last_fetch = Some(Instant::now());
+            self.fetch = self.repo.fetch_command().and_then(|mut cmd| cmd.spawn().ok());
+        }
+    }
+
+    // Fetches right away (or waits for a background fetch that's already running). Returns whether it succeeded.
+    fn fetch_now(&mut self, terminal: &mut DefaultTerminal) -> Result<bool> {
+        let target = self.target.clone().unwrap_or_else(|| "origin".into());
+        self.set_status(format!("Fetching {target}…"), false);
+        terminal.draw(|f| self.draw(f))?;
+
+        let status = match self.fetch.take() {
+            Some(mut fetch) => fetch.wait().ok(),
+            None => self.repo.fetch_command().and_then(|mut cmd| cmd.status().ok()),
+        };
+        self.last_fetch = Some(Instant::now());
+        self.fetch_failed = !status.is_some_and(|s| s.success());
+        self.status = None;
+        Ok(!self.fetch_failed)
     }
 
     fn current_fingerprint(&self) -> String {
         let mut out = self.repo.run(&["rev-parse", "--symbolic-full-name", "HEAD"]).unwrap_or_default();
         out += &self.repo.run(&["rev-parse", "HEAD"]).unwrap_or_default();
-        if let Some(base) = &self.base {
-            out += &self.repo.run(&["rev-parse", base]).unwrap_or_default();
+        for rev in self.base.iter().chain(&self.target) {
+            out += &self.repo.run(&["rev-parse", rev]).unwrap_or_default();
         }
         out + &self.repo.worktree_fingerprint()
     }
@@ -211,6 +263,8 @@ impl App {
         self.branch = self.repo.branch();
         self.base = self.repo.base_ref();
         (self.ahead, self.behind) = self.base.as_deref().map(|b| self.repo.ahead_behind(b)).unwrap_or((0, 0));
+        self.target = self.repo.default_remote_branch();
+        self.behind_target = self.target.as_deref().map(|t| self.repo.ahead_behind(t).1).unwrap_or(0);
         self.commits = self.repo.uncommitted();
         self.commits.extend(self.repo.commits(self.base.as_deref(), PUSHED_COMMITS_SHOWN)?);
         stale.sort_by_key(|(index, _)| *index);
@@ -583,36 +637,57 @@ impl App {
         Ok(())
     }
 
-    // Asks to push `rev` to the default remote branch (e.g. origin/main).
-    fn confirm_push(&mut self, rev: String) {
+    // Asks to push `rev` to the default remote branch (e.g. origin/main), after fetching it to see if we need to rebase first.
+    fn confirm_push(&mut self, terminal: &mut DefaultTerminal, rev: String) -> Result<()> {
         if self.repo.rebase_in_progress() {
             self.set_status("A rebase is in progress – not pushing", true);
-            return;
+            return Ok(());
         }
         let Some(onto) = self.repo.default_remote_branch() else {
             self.set_status("No origin/main or origin/master to push to", true);
-            return;
+            return Ok(());
         };
+        let fetched = self.fetch_now(terminal)?;
+        let rev = self.repo.rev_parse(&rev)?;
         let commits = self.repo.run(&["log", "--format=%h %s", &format!("{onto}..{rev}")]).unwrap_or_default();
         if commits.is_empty() {
             self.set_status(format!("Nothing to push to {onto}"), true);
-            return;
+            return Ok(());
         }
+        let behind = self.repo.run(&["rev-list", "--count", &format!("{rev}..{onto}")])?.trim().parse().unwrap_or(0);
 
         let (remote, branch) = onto.split_once('/').unwrap_or(("origin", &onto));
         self.pending_push = Some(PendingPush {
             rev,
+            onto: onto.clone(),
+            behind,
+            fetch_failed: !fetched,
             remote: remote.to_string(),
             worktree_branch: self.repo.is_linked_worktree().then(|| self.branch.clone().unwrap_or_else(|| "detached HEAD".into())),
             branch: branch.to_string(),
             commits: commits.lines().map(String::from).collect(),
         });
+        Ok(())
     }
 
     // Runs in the real terminal, since git may need to ask for credentials. Never forces.
     fn push(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let Some(push) = self.pending_push.take() else { return Ok(()) };
-        let rev = self.repo.rev_parse(&push.rev)?;
+        let mut rev = push.rev.clone();
+        if push.behind > 0 {
+            if self.repo.rebase_in_progress() {
+                self.set_status("A rebase is in progress – not pushing", true);
+                return Ok(());
+            }
+            match rewrite::rebase(&self.repo, &push.onto) {
+                Ok(mapping) => rev = mapping.get(&rev).cloned().unwrap_or(rev),
+                Err(e) => {
+                    self.reload(None)?;
+                    self.set_status(format!("Couldn't rebase onto {}, so didn't push: {e:#}", push.onto), true);
+                    return Ok(());
+                }
+            }
+        }
         let refspec = format!("{rev}:refs/heads/{}", push.branch);
 
         let pushed = self.suspend(terminal, |app| {
@@ -637,10 +712,20 @@ impl App {
         let Some(push) = &self.pending_push else { return };
         let area = frame.area();
         let shown = push.commits.len().min(area.height.saturating_sub(8) as usize);
-        let note = push.worktree_branch.as_ref().map(|b| format!("Worktree: pushes {b} straight to {}/{}", push.remote, push.branch));
-        let widest = push.commits.iter().chain(&note).map(|c| c.chars().count()).max().unwrap_or(0);
+        let mut notes: Vec<(String, Color)> = vec![];
+        if let Some(branch) = &push.worktree_branch {
+            notes.push((format!("Worktree: pushes {branch} straight to {}", push.onto), Color::Yellow));
+        }
+        if push.fetch_failed {
+            notes.push((format!("Couldn't fetch {}, so it may be out of date", push.onto), Color::Red));
+        }
+        if push.behind > 0 {
+            notes.push((format!("{} has {} we don't, so this rebases onto it first", push.onto, commits(push.behind)), Color::Yellow));
+        }
+        let widest = push.commits.iter().chain(notes.iter().map(|(n, _)| n)).map(|c| c.chars().count()).max().unwrap_or(0);
         let width = (widest as u16 + 4).clamp(44, area.width.saturating_sub(4).max(1));
-        let height = (lines_needed(shown, push.commits.len()) as u16 + if note.is_some() { 2 } else { 0 }).min(area.height);
+        let notes_height = if notes.is_empty() { 0 } else { notes.len() + 1 };
+        let height = ((lines_needed(shown, push.commits.len()) + notes_height) as u16).min(area.height);
         let modal = ratatui::layout::Rect {
             x: area.x + (area.width.saturating_sub(width)) / 2,
             y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -648,7 +733,10 @@ impl App {
             height,
         };
 
-        let mut lines: Vec<Line> = note.into_iter().flat_map(|n| [Line::from(n).bold().yellow(), Line::raw("")]).collect();
+        let mut lines: Vec<Line> = notes.into_iter().map(|(n, color)| Line::from(n).bold().fg(color)).collect();
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
         lines.extend(push.commits.iter().take(shown).map(|c| {
             let (hash, summary) = c.split_once(' ').unwrap_or((c, ""));
             Line::from(vec![hash.to_string().yellow(), Span::raw(format!(" {summary}"))])
@@ -657,7 +745,7 @@ impl App {
             lines.push(Line::from(format!("…and {} more", push.commits.len() - shown)).fg(DIM));
         }
         lines.push(Line::raw(""));
-        lines.push(Line::from(vec!["y".bold().cyan(), Span::raw("/"), "Enter".bold().cyan(), Span::raw(" push   any other key cancels")]));
+        lines.push(Line::from(vec!["y".bold().cyan(), Span::raw("/"), "Enter".bold().cyan(), Span::raw(if push.behind > 0 { " rebase and push   any other key cancels" } else { " push   any other key cancels" })]));
 
         let title = format!(" Push {} to {}/{}? ", commits(push.commits.len()), push.remote, push.branch);
         let block = Block::bordered().title(title.bold()).border_style(Style::new().fg(Color::Cyan)).padding(ratatui::widgets::Padding::horizontal(1));
@@ -670,14 +758,26 @@ impl App {
             self.set_status("No origin/main or origin/master to rebase onto", true);
             return Ok(());
         };
-        let remote = onto.split('/').next().unwrap_or("origin").to_string();
+        if self.repo.rebase_in_progress() {
+            self.set_status("A rebase is already in progress", true);
+            return Ok(());
+        }
+        if !self.fetch_now(terminal)? {
+            self.set_status(format!("Couldn't fetch {onto}"), true);
+            return Ok(());
+        }
+        let error = match rewrite::rebase(&self.repo, &onto) {
+            Ok(_) => {
+                self.reload(None)?;
+                self.set_status(format!("Rebased onto {onto}"), false);
+                return Ok(());
+            }
+            Err(e) => format!("{e:#}"),
+        };
 
         let succeeded = self.suspend(terminal, |app| {
-            let run = |args: &[&str]| {
-                println!("\n$ git {}", args.join(" "));
-                app.repo.command().args(args).status().is_ok_and(|s| s.success())
-            };
-            let ok = run(&["fetch", &remote]) && run(&["rebase", "--autostash", &onto]);
+            println!("Couldn't rebase in memory: {error}\nFalling back to a real rebase.\n\n$ git rebase --autostash {onto}");
+            let ok = app.repo.command().args(["rebase", "--autostash", &onto]).status().is_ok_and(|s| s.success());
             if !ok {
                 print!("\nPress Enter to return to gg…");
                 let _ = std::io::stdout().flush();
@@ -690,7 +790,7 @@ impl App {
         if succeeded {
             self.set_status(format!("Rebased onto {onto}"), false);
         } else {
-            self.set_status("Fetch or rebase failed", true);
+            self.set_status("Rebase failed", true);
         }
         Ok(())
     }
@@ -740,7 +840,16 @@ impl App {
             spans.push(Span::raw(format!("↑{}", self.ahead)).green());
             spans.push(Span::raw(" "));
             let behind = Span::raw(format!("↓{}", self.behind));
-            spans.push(if self.behind > 0 { behind.yellow() } else { behind.fg(DIM) });
+            spans.push(if self.behind > 0 { behind.yellow().bold() } else { behind.fg(DIM) });
+        }
+        if let Some(target) = &self.target
+            && self.base.as_ref() != Some(target)
+            && self.behind_target > 0
+        {
+            spans.push(Span::raw(format!("  ↓{} {target}", self.behind_target)).yellow().bold());
+        }
+        if self.fetch_failed {
+            spans.push(Span::raw("  fetch failed").red());
         }
         if let Some((message, error)) = &self.status {
             spans.push(Span::raw("   "));
