@@ -29,6 +29,8 @@ const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const FETCH_INTERVAL: Duration = Duration::from_secs(120);
 const DIM: Color = Color::DarkGray;
 const SELECTED_BG: Color = Color::Indexed(237);
+const REMOVED_BG: Color = Color::Indexed(52);
+const ADDED_BG: Color = Color::Indexed(22);
 
 struct PendingPush {
     rev: String,
@@ -384,7 +386,9 @@ impl App {
             let text = match self.repo.show_entry(&entry, self.ignore_whitespace) {
                 Ok(bytes) => {
                     let bytes = String::from_utf8_lossy(&bytes).replace('\t', "    ");
-                    bytes.into_bytes().into_text().unwrap_or_else(|e| Text::raw(e.to_string()))
+                    let mut text = bytes.into_bytes().into_text().unwrap_or_else(|e| Text::raw(e.to_string()));
+                    highlight_changes(&mut text);
+                    text
                 }
                 Err(e) => Text::raw(e.to_string()),
             };
@@ -1050,6 +1054,59 @@ fn wrap(text: &Text<'static>, width: usize) -> (Text<'static>, Vec<(usize, usize
     (Text::from(rows), hunks)
 }
 
+// Like Git's diff-highlight: pairs up removed lines with the added lines directly after them, in order, and highlights what changed in each pair, i.e. what's between their common prefix and suffix. Pairs with less than half in common are left alone, as they're probably unrelated lines.
+fn highlight_changes(text: &mut Text<'static>) {
+    let plain: Vec<Vec<char>> = text.lines.iter().map(|l| l.spans.iter().flat_map(|s| s.content.chars()).collect()).collect();
+    let starts_with = |i: usize, c: char| plain.get(i).is_some_and(|l| l.first() == Some(&c));
+    let mut in_hunk = false;
+    let mut i = 0;
+    while i < plain.len() {
+        // Merge commits' combined diffs have "@@@" hunks with two marker columns, which we leave alone.
+        if plain[i].starts_with(&['@', '@', ' ']) {
+            in_hunk = true;
+        } else if !(starts_with(i, ' ') || starts_with(i, '-') || starts_with(i, '+') || starts_with(i, '\\')) {
+            in_hunk = false;
+        }
+        if !in_hunk || !starts_with(i, '-') {
+            i += 1;
+            continue;
+        }
+
+        let added_start = (i..).find(|&j| !starts_with(j, '-')).unwrap();
+        let added_end = (added_start..).find(|&j| !starts_with(j, '+')).unwrap();
+        for (old, new) in (i..added_start).zip(added_start..added_end) {
+            let (a, b) = (&plain[old][1..], &plain[new][1..]);
+            let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+            let max_suffix = a.len().min(b.len()) - prefix;
+            let suffix = a.iter().rev().zip(b.iter().rev()).take(max_suffix).take_while(|(x, y)| x == y).count();
+            if (prefix + suffix) * 2 >= a.len().max(b.len()) && a != b {
+                set_background(&mut text.lines[old], 1 + prefix, 1 + a.len() - suffix, REMOVED_BG);
+                set_background(&mut text.lines[new], 1 + prefix, 1 + b.len() - suffix, ADDED_BG);
+            }
+        }
+        i = added_end;
+    }
+}
+
+// Sets the background of the characters from `start` (inclusive) to `end` (exclusive).
+fn set_background(line: &mut Line<'static>, start: usize, end: usize, bg: Color) {
+    let mut spans = Vec::with_capacity(line.spans.len() + 2);
+    let mut pos = 0;
+    for span in line.spans.drain(..) {
+        let chars: Vec<char> = span.content.chars().collect();
+        let len = chars.len();
+        let (from, to) = (start.clamp(pos, pos + len) - pos, end.clamp(pos, pos + len) - pos);
+        for (a, b, highlighted) in [(0, from, false), (from, to, true), (to, len, false)] {
+            if a < b {
+                let style = if highlighted { span.style.bg(bg) } else { span.style };
+                spans.push(Span::styled(chars[a..b].iter().collect::<String>(), style));
+            }
+        }
+        pos += len;
+    }
+    line.spans = spans;
+}
+
 // Captures the mouse so the wheel scrolls the diff, rather than the terminal sending arrow keys.
 fn init_terminal() -> DefaultTerminal {
     let terminal = ratatui::init();
@@ -1075,4 +1132,26 @@ fn commits(count: usize) -> String {
 fn clamp_list_width(width: u16, total: u16) -> u16 {
     let max = total.saturating_sub(MIN_PANE_WIDTH).max(MIN_PANE_WIDTH.min(total));
     width.clamp(MIN_PANE_WIDTH.min(max), max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn highlighted(line: &Line) -> Vec<String> {
+        line.spans.iter().filter(|s| s.style.bg.is_some()).map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn highlights_what_changed_in_paired_lines() {
+        let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,4 +1,4 @@\n same\n-let x = foo(1);\n-gone\n+let x = bar(1);\n+something else entirely\n+added\n";
+        let mut text = Text::from(diff);
+        highlight_changes(&mut text);
+
+        assert_eq!(highlighted(&text.lines[1]), Vec::<String>::new());
+        assert_eq!(highlighted(&text.lines[5]), ["foo"]);
+        assert_eq!(highlighted(&text.lines[7]), ["bar"]);
+        assert_eq!(highlighted(&text.lines[6]), Vec::<String>::new());
+        assert_eq!(highlighted(&text.lines[8]), Vec::<String>::new());
+    }
 }
