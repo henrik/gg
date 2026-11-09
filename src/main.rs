@@ -196,6 +196,8 @@ impl App {
         match key.code {
             KeyCode::Char('Q') => return Ok(true),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => self.move_commit(true),
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => self.move_commit(false),
             KeyCode::Up => self.select(self.selected().saturating_sub(1)),
             KeyCode::Down => self.select(self.selected() + 1),
             KeyCode::PageUp => self.diff_scroll = self.diff_scroll.saturating_sub(page),
@@ -537,6 +539,40 @@ impl App {
         Some(commit)
     }
 
+    // Moves the selected commit up (later) or down (earlier) by swapping it with its neighbour.
+    fn move_commit(&mut self, up: bool) {
+        let Some(commit) = self.amendable_commit() else { return };
+        if self.rebase_in_progress {
+            self.set_status("A rebase is in progress – not moving commits", true);
+            return;
+        }
+        let index = self.selected();
+        let neighbour = if up { index.checked_sub(1) } else { Some(index + 1) };
+        let Some(neighbour) = neighbour.and_then(|i| self.commits.get(i)).filter(|c| c.kind == Kind::Commit && !c.stale).cloned() else {
+            self.set_status(format!("Nothing to move {} past", commit.short), true);
+            return;
+        };
+
+        // Swapping with the commit above is swapping that commit with its parent.
+        let (child, parent) = if up { (&neighbour, &commit) } else { (&commit, &neighbour) };
+        if !self.repo.rev_parse(&format!("{}^", child.hash)).is_ok_and(|p| p == parent.hash) {
+            self.set_status(format!("{} isn't the parent of {}", parent.short, child.short), true);
+            return;
+        }
+        match rewrite::swap_with_parent(&self.repo, &child.hash, self.base.as_deref()) {
+            Ok((new_child, new_parent)) => {
+                let moved = if up { new_parent } else { new_child };
+                let result = self.reload(Some(&moved));
+                let direction = if up { "up" } else { "down" };
+                self.set_status(format!("Moved {} {direction}", commit.short), false);
+                if let Err(e) = result {
+                    self.set_status(format!("{e:#}"), true);
+                }
+            }
+            Err(e) => self.set_status(format!("{e:#}"), true),
+        }
+    }
+
     fn amend(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let Some(commit) = self.amendable_commit() else { return Ok(()) };
 
@@ -827,6 +863,7 @@ impl App {
 
         let keys = [
             ("↑↓", "commit"),
+            ("Ctrl+↑↓", "move"),
             ("PgUp/PgDn", "scroll"),
             ("Home/End", "top/end"),
             ("j/k", "hunk"),

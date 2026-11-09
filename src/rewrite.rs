@@ -84,6 +84,47 @@ pub fn rebase(repo: &Repo, onto: &str) -> Result<HashMap<String, String>> {
     bail!("HEAD kept moving; gave up after {MAX_ATTEMPTS} attempts")
 }
 
+// Swaps `commit` with its parent, replaying any later commits on top. Refuses unless both are unpushed, non-merge commits whose changes are independent: the swapped pair must end up with exactly the same tree, so the code at HEAD doesn't change. Returns the new hashes of `commit` and its parent.
+pub fn swap_with_parent(repo: &Repo, commit: &str, base: Option<&str>) -> Result<(String, String)> {
+    let short = &commit[..commit.len().min(7)];
+    let [parent] = parents(repo, commit)?.try_into().map_err(|_| anyhow!("Can't move merge commit {short}"))?;
+    let parent_short = &parent[..7];
+    let [grandparent] = parents(repo, &parent)?
+        .try_into()
+        .map_err(|_| anyhow!("Can't move {short} past {parent_short}, which is a merge or the first commit"))?;
+
+    for _ in 0..MAX_ATTEMPTS {
+        let head = repo.rev_parse("HEAD")?;
+        if !repo.is_ancestor(commit, &head) {
+            bail!("{short} is no longer on this branch (rewritten or reset in the meantime?)");
+        }
+        if let Some(base) = base
+            && repo.is_ancestor(&parent, base)
+        {
+            bail!("Can't move {short} past {parent_short}, which has been pushed to {base}");
+        }
+
+        let committer = repo.run(&["var", "GIT_COMMITTER_IDENT"])?;
+        let committer = Some(committer.trim());
+        let moved_tree = cherry_pick_tree(repo, commit, &parent, &grandparent)
+            .map_err(|_| anyhow!("{short} depends on {parent_short}, so they can't be swapped"))?;
+        let new_commit = write_commit(repo, commit, std::slice::from_ref(&grandparent), Some(&moved_tree), committer, None)?;
+        let parent_tree = cherry_pick_tree(repo, &parent, &grandparent, &new_commit)
+            .map_err(|_| anyhow!("{short} and {parent_short} change the same lines, so they can't be swapped"))?;
+        if parent_tree != tree(repo, commit)? {
+            bail!("Swapping {short} and {parent_short} would change the resulting code, so not doing it");
+        }
+        let new_parent = write_commit(repo, &parent, std::slice::from_ref(&new_commit), Some(&parent_tree), committer, None)?;
+
+        let new_head = replay(repo, commit, &new_parent, &head)?;
+        if move_head(repo, &head, &new_head, &format!("gg: swap {short} and {parent_short}"))? {
+            return Ok((new_commit, new_parent));
+        }
+    }
+
+    bail!("HEAD kept moving; gave up after {MAX_ATTEMPTS} attempts")
+}
+
 // Returns false if HEAD moved in the meantime, meaning we should try again.
 fn move_head(repo: &Repo, old: &str, new: &str, message: &str) -> Result<bool> {
     if tree(repo, old)? == tree(repo, new)? {
@@ -407,6 +448,47 @@ mod tests {
         assert_eq!(read(&repo, "e"), "e");
         assert_eq!(read(&repo, "a"), "uncommitted");
         assert_eq!(repo.run(&["status", "--porcelain"]).unwrap(), " M a\n");
+    }
+
+    #[test]
+    fn swaps_independent_commits_keeping_later_ones() {
+        let repo = repo("swap");
+        commit(&repo, "a", "a", "A");
+        commit(&repo, "b", "b", "B");
+        let c = commit(&repo, "c", "c", "C");
+        commit(&repo, "d", "d", "D");
+        let tree_before = tree(&repo, "HEAD").unwrap();
+
+        let (new_c, _) = swap_with_parent(&repo, &c, None).unwrap();
+
+        assert_eq!(log(&repo), "D\nB\nC\nA\n");
+        assert_eq!(repo.rev_parse("HEAD~2").unwrap(), new_c);
+        assert_eq!(tree(&repo, "HEAD").unwrap(), tree_before);
+    }
+
+    #[test]
+    fn refuses_to_swap_dependent_commits() {
+        let repo = repo("swap-dependent");
+        commit(&repo, "a", "a", "A");
+        commit(&repo, "f", "one\n", "B");
+        let c = commit(&repo, "f", "two\n", "C");
+
+        let error = swap_with_parent(&repo, &c, None).unwrap_err();
+
+        assert!(error.to_string().contains("depends on"), "{error}");
+        assert_eq!(repo.rev_parse("HEAD").unwrap(), c);
+    }
+
+    #[test]
+    fn refuses_to_swap_with_pushed_commit() {
+        let repo = repo("swap-pushed");
+        commit(&repo, "a", "a", "A");
+        let b = commit(&repo, "b", "b", "B");
+        repo.run(&["update-ref", "refs/remotes/origin/main", &b]).unwrap();
+        let c = commit(&repo, "c", "c", "C");
+
+        assert!(swap_with_parent(&repo, &c, Some("origin/main")).is_err());
+        assert_eq!(repo.rev_parse("HEAD").unwrap(), c);
     }
 
     #[test]

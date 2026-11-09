@@ -29,6 +29,7 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 | `↑`/`↓`, click | Select commit |
 | `PgUp`/`PgDn`, mouse wheel | Scroll diff |
 | `Home`/`End` | Jump to top/bottom of diff |
+| `Ctrl+↑`/`Ctrl+↓` | Move the commit up/down past its neighbour |
 | `j`/`k` | Next/previous hunk |
 | `w` | Toggle hiding whitespace changes in diffs (like `git diff -w`) |
 | `r` | Reword (and optionally edit the diff) |
@@ -53,4 +54,6 @@ In `r`, the commit's diff appears below the scissors line, as with `git commit -
 
 `A` instead stops an interactive rebase at the commit and opens its files in the real repo, so agents can see a rebase is in progress. When you quit Vim it offers to amend and continue, abort, or leave the rebase in progress.
 
-Pushed commits can't be reworded or amended.
+`Ctrl+↑`/`Ctrl+↓` work the same way. They refuse if either commit is pushed or a merge, if a rebase is in progress, or if the two commits aren't independent: the swapped pair must produce exactly the same code as before, so the result at HEAD never changes.
+
+Pushed commits can't be reworded, amended or moved.
