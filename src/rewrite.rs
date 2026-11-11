@@ -1,6 +1,6 @@
 //! Rewrites one commit in the current branch (new message and/or new tree) while something else (e.g. Claude) may be committing in parallel.
 //!
-//! The target is pinned by hash when editing starts. Only once the edit is done do we read HEAD, recreate the target and replay every descendant up to HEAD as new commit objects in memory (`git merge-tree`, never touching the working tree), and then move HEAD with a compare-and-swap. If HEAD moved in the meantime, we redo it against the new HEAD.
+//! The target is pinned by hash when editing starts. Only once the edit is done do we read HEAD, recreate the target and replay every descendant up to HEAD as new commit objects in memory (`git merge-tree`, never touching the working tree), and then move HEAD with a compare-and-swap. If HEAD moved in the meantime, we redo it against the new HEAD. If the target itself was rewritten in the meantime, the change is carried over to its successor.
 //!
 //! When the replay changes HEAD's tree, the index and working tree are updated with a two-way `read-tree -m -u` while holding the index lock, so nobody can commit in between, and uncommitted changes to unrelated files are kept.
 
@@ -19,38 +19,103 @@ pub struct Change<'a> {
     pub tree: Option<&'a str>,
 }
 
-// Returns the hash of the rewritten commit.
-pub fn rewrite(repo: &Repo, target: &str, change: Change, base: Option<&str>) -> Result<String> {
+#[derive(Debug)]
+pub struct Rewritten {
+    pub hash: String,
+
+    // Set when the target was rewritten by someone else while being edited, so the edit was carried over to its successor.
+    pub followed: Option<Followed>,
+}
+
+#[derive(Debug)]
+pub struct Followed {
+    pub successor: String,
+    pub already_there: bool,
+}
+
+// If the target was rewritten in the meantime (e.g. amended or rebased by someone else), the change is carried over to the commit it became, as long as that can be done without conflicts.
+pub fn rewrite(repo: &Repo, target: &str, change: Change, base: Option<&str>) -> Result<Rewritten> {
     let short = &target[..target.len().min(7)];
+    let committer = repo.run(&["var", "GIT_COMMITTER_IDENT"])?;
+    let committer = Some(committer.trim());
+    let edited = write_commit(repo, target, &parents(repo, target)?, change.tree, committer, change.message)?;
 
     for _ in 0..MAX_ATTEMPTS {
         let head = repo.rev_parse("HEAD")?;
-        if !repo.is_ancestor(target, &head) {
-            bail!("{short} is no longer on this branch (rewritten or reset in the meantime?)");
-        }
+        let current = if repo.is_ancestor(target, &head) { target.to_string() } else { successor(repo, target, &head, base)? };
+        let current_short = &current[..7];
         if let Some(base) = base
-            && repo.is_ancestor(target, base)
+            && repo.is_ancestor(&current, base)
         {
-            bail!("{short} has been pushed to {base}");
+            bail!("{current_short} has been pushed to {base}");
         }
 
-        let committer = repo.run(&["var", "GIT_COMMITTER_IDENT"])?;
-        let new_target = write_commit(
-            repo,
-            target,
-            &parents(repo, target)?,
-            change.tree,
-            Some(committer.trim()),
-            change.message,
-        )?;
-        let new_head = replay(repo, target, &new_target, &head)?;
+        let (new_target, followed) = if current == target {
+            (edited.clone(), None)
+        } else {
+            let new_tree = match change.tree {
+                None => None,
+                Some(_) => Some(
+                    cherry_pick_tree(repo, &edited, target, &current)
+                        .map_err(|e| anyhow!("{short} was rewritten as {current_short} meanwhile, and your edits conflict with it: {e:#}"))?,
+                ),
+            };
+            let message = match change.message {
+                None => None,
+                Some(message) => {
+                    let current_message = repo.message(&current)?;
+                    if current_message.trim_end() == message.trim_end() {
+                        None
+                    } else if current_message.trim_end() == repo.message(target)?.trim_end() {
+                        Some(message)
+                    } else {
+                        bail!("{short} was rewritten as {current_short} meanwhile, with a different message than yours");
+                    }
+                }
+            };
 
-        if move_head(repo, &head, &new_head, &format!("gg: rewrite {short}"))? {
-            return Ok(new_target);
+            if message.is_none() && new_tree.as_ref().is_none_or(|t| tree(repo, &current).is_ok_and(|c| &c == t)) {
+                return Ok(Rewritten { hash: current.clone(), followed: Some(Followed { successor: current, already_there: true }) });
+            }
+            let new_target = write_commit(repo, &current, &parents(repo, &current)?, new_tree.as_deref(), committer, message)?;
+            (new_target, Some(Followed { successor: current.clone(), already_there: false }))
+        };
+        let new_head = replay(repo, &current, &new_target, &head)?;
+        if move_head(repo, &head, &new_head, &format!("gg: rewrite {current_short}"))? {
+            return Ok(Rewritten { hash: new_target, followed });
         }
     }
 
     bail!("HEAD kept moving; gave up after {MAX_ATTEMPTS} attempts")
+}
+
+// The commit on the branch that `commit` became after being amended or rebased, recognised by having the same author and author date. Errors if there isn't exactly one.
+pub fn successor(repo: &Repo, commit: &str, head: &str, base: Option<&str>) -> Result<String> {
+    let short = &commit[..commit.len().min(7)];
+    let format = ["--format=%H %an <%ae> %ad%x00%s", "--date=raw"];
+    let wanted = repo.run(&["log", "-1", format[0], format[1], commit])?;
+    let (_, wanted) = wanted.trim().split_once(' ').unwrap_or_default();
+    let (wanted_author, _) = wanted.split_once('\0').unwrap_or_default();
+
+    let mut args = vec!["log", format[0], format[1], head];
+    let not_base = base.map(|b| format!("^{b}"));
+    if let Some(not_base) = &not_base {
+        args.push(not_base);
+    }
+    let out = repo.run(&args)?;
+    let candidates: Vec<(&str, &str)> = out.lines().filter_map(|l| l.split_once(' ')).collect();
+    let mut matches: Vec<&str> = candidates.iter().filter(|(_, c)| c.split('\0').next() == Some(wanted_author)).map(|(h, _)| *h).collect();
+
+    // Several commits made in the same second can share an author date.
+    if matches.len() > 1 {
+        matches = candidates.iter().filter(|(_, c)| *c == wanted).map(|(h, _)| *h).collect();
+    }
+
+    match matches.as_slice() {
+        [one] => Ok(one.to_string()),
+        [] => bail!("{short} is no longer on this branch, and no commit looks like a rewritten version of it"),
+        _ => bail!("{short} is no longer on this branch, and several commits look like rewritten versions of it"),
+    }
 }
 
 // Like `git rebase onto`, but in memory and moving HEAD as `rewrite` does, so there's no stash or half-done rebase for anyone to trip over. Commits whose changes are already in `onto` are dropped. Returns the new hash of each replayed commit (or for a dropped one, of what took its place).
@@ -312,8 +377,14 @@ mod tests {
     fn commit(repo: &Repo, file: &str, content: &str, message: &str) -> String {
         std::fs::write(repo.dir.join(file), content).unwrap();
         repo.run(&["add", file]).unwrap();
-        repo.run(&["commit", "-q", "-m", message]).unwrap();
+        repo.run(&["commit", "-q", "-m", message, &next_date()]).unwrap();
         repo.rev_parse("HEAD").unwrap()
+    }
+
+    // Distinct author dates, since that's how rewritten commits are recognised.
+    fn next_date() -> String {
+        static SECONDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_700_000_000);
+        format!("--date=@{}", SECONDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 
     fn log(repo: &Repo) -> String {
@@ -347,7 +418,7 @@ mod tests {
         commit(&repo, "d", "d", "D");
 
         let message = "B reworded\n\nWith body.\n";
-        let new_target = rewrite(&repo, &target, Change { message: Some(message), ..Default::default() }, None).unwrap();
+        let new_target = rewrite(&repo, &target, Change { message: Some(message), ..Default::default() }, None).unwrap().hash;
 
         assert_eq!(log(&repo), "D\nC\nB reworded\nA\n");
         assert_eq!(repo.message(&new_target).unwrap(), "B reworded\n\nWith body.\n\n");
@@ -413,6 +484,70 @@ mod tests {
 
         assert!(rewrite(&repo, &target, Change { message: Some("B reworded\n"), ..Default::default() }, None).is_err());
         assert_eq!(log(&repo), "B amended elsewhere\nA\n");
+    }
+
+    #[test]
+    fn carries_amend_over_to_commit_amended_elsewhere() {
+        let repo = repo("followamend");
+        commit(&repo, "a", "a", "A");
+        let target = commit(&repo, "f", "one\ntwo\nthree\nfour\n", "B");
+        commit(&repo, "c", "c", "C");
+
+        // Simulates Claude amending B while the user is editing it.
+        let elsewhere = rewrite(&repo, &target, Change { tree: Some(&tree_with(&repo, &target, "f", "one\ntwo\nthree\nFOUR\n")), ..Default::default() }, None)
+            .unwrap()
+            .hash;
+
+        let new_tree = tree_with(&repo, &target, "f", "ONE\ntwo\nthree\nfour\n");
+        let rewritten = rewrite(&repo, &target, Change { tree: Some(&new_tree), ..Default::default() }, None).unwrap();
+
+        let followed = rewritten.followed.unwrap();
+        assert_eq!(followed.successor, elsewhere);
+        assert!(!followed.already_there);
+        assert_eq!(log(&repo), "C\nB\nA\n");
+        assert_eq!(repo.run(&["show", "HEAD~:f"]).unwrap(), "ONE\ntwo\nthree\nFOUR\n");
+        assert_eq!(read(&repo, "f"), "ONE\ntwo\nthree\nFOUR\n");
+    }
+
+    #[test]
+    fn carries_reword_over_to_commit_amended_elsewhere() {
+        let repo = repo("followreword");
+        let target = commit(&repo, "f", "one\n", "A");
+        repo.run(&["commit", "-q", "--amend", "--no-edit", "--allow-empty"]).unwrap();
+        commit(&repo, "f", "two\n", "B");
+
+        rewrite(&repo, &target, Change { message: Some("A reworded\n"), ..Default::default() }, None).unwrap();
+        assert_eq!(log(&repo), "B\nA reworded\n");
+    }
+
+    #[test]
+    fn notices_when_commit_amended_elsewhere_already_has_the_edits() {
+        let repo = repo("followsame");
+        let target = commit(&repo, "f", "one\n", "A");
+        let new_tree = tree_with(&repo, &target, "f", "uno\n");
+        std::fs::write(repo.dir.join("f"), "uno\n").unwrap();
+        repo.run(&["commit", "-q", "-a", "--amend", "--no-edit"]).unwrap();
+        let elsewhere = repo.rev_parse("HEAD").unwrap();
+
+        let rewritten = rewrite(&repo, &target, Change { tree: Some(&new_tree), ..Default::default() }, None).unwrap();
+
+        assert!(rewritten.followed.unwrap().already_there);
+        assert_eq!(repo.rev_parse("HEAD").unwrap(), elsewhere);
+    }
+
+    #[test]
+    fn refuses_to_carry_over_conflicting_edits() {
+        let repo = repo("followconflict");
+        let target = commit(&repo, "f", "one\n", "A");
+        std::fs::write(repo.dir.join("f"), "uno\n").unwrap();
+        repo.run(&["commit", "-q", "-a", "--amend", "--no-edit"]).unwrap();
+        let elsewhere = repo.rev_parse("HEAD").unwrap();
+
+        let new_tree = tree_with(&repo, &target, "f", "ett\n");
+        let error = rewrite(&repo, &target, Change { tree: Some(&new_tree), ..Default::default() }, None).unwrap_err();
+
+        assert!(error.to_string().contains("rewritten as"), "{error}");
+        assert_eq!(repo.rev_parse("HEAD").unwrap(), elsewhere);
     }
 
     #[test]

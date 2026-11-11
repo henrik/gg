@@ -44,7 +44,7 @@ Pushes fetch first, then ask for confirmation in a modal, and never force. If `o
 
 ### Rewriting safely alongside agents
 
-`r` and `a` are safe while agents keep committing: you edit the message, or the commit's changed files, in a scratch copy. Only afterwards does gg replay any newer commits onto the rewritten one in memory and move HEAD with a compare-and-swap. The working tree is only updated (under the index lock) when the replay changes HEAD's tree, keeping unrelated uncommitted changes. It fails if the commit has left the branch, if a later commit conflicts with the change, or if uncommitted changes are in the way. A failed `a` keeps your edits, and pressing `a` again retries them.
+`r` and `a` are safe while agents keep committing: you edit the message, or the commit's changed files, in a scratch copy. Only afterwards does gg replay any newer commits onto the rewritten one in memory and move HEAD with a compare-and-swap. The working tree is only updated (under the index lock) when the replay changes HEAD's tree, keeping unrelated uncommitted changes. If someone else (e.g. Claude) amends, rewords or rebases the commit while you're editing it, gg finds the commit it became (same author and author date) and applies your edits to that instead, or tells you if it already has them. It fails if your edits conflict with theirs, if the commit has left the branch in some other way, if a later commit conflicts with the change, or if uncommitted changes are in the way. A failed `a` keeps your edits, and pressing `a` again retries them.
 
 `a` opens the files the commit adds or modifies in Vim tabs, each scrolled to its first change.
 

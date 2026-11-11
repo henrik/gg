@@ -506,11 +506,11 @@ impl App {
                     rewrite::rewrite(&self.repo, &commit.hash, change, self.base.as_deref())
                 });
             match result {
-                Ok(new_hash) => {
+                Ok(rewritten) => {
                     let _ = std::fs::remove_dir_all(&dir);
-                    self.reload(Some(&new_hash))?;
+                    self.reload(Some(&rewritten.hash))?;
                     let what = if patch_changed { "Amended" } else { "Reworded" };
-                    self.set_status(format!("{what} {}", commit.short), false);
+                    self.set_status(rewritten_status(what, &commit.short, &rewritten), false);
                 }
                 Err(e) => self.set_status(format!("Reword failed: {e:#}. Your edits are kept in {}", path.display()), true),
             }
@@ -580,9 +580,9 @@ impl App {
     fn amend(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let Some(commit) = self.amendable_commit() else { return Ok(()) };
 
-        // Retrying after a failure reuses the earlier edits.
+        // Retrying after a failure reuses the earlier edits, also if the commit has been rewritten since.
         let scratch = match self.pending_amend.take() {
-            Some(scratch) if scratch.commit == commit.hash => scratch,
+            Some(scratch) if scratch.commit == commit.hash || self.is_successor(&commit.hash, &scratch.commit) => scratch,
             _ => amend::Scratch::prepare(&self.repo, &commit.hash)?,
         };
         if scratch.files.is_empty() {
@@ -611,10 +611,10 @@ impl App {
                 self.set_status("No changes", false);
                 scratch.remove();
             }
-            Ok(Some(new_hash)) => {
+            Ok(Some(rewritten)) => {
                 scratch.remove();
-                self.reload(Some(&new_hash))?;
-                self.set_status(format!("Amended {}", commit.short), false);
+                self.reload(Some(&rewritten.hash))?;
+                self.set_status(rewritten_status("Amended", &commit.short, &rewritten), false);
             }
             Err(e) => {
                 let dir = scratch.files_dir();
@@ -623,6 +623,11 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn is_successor(&self, commit: &str, of: &str) -> bool {
+        let Ok(head) = self.repo.rev_parse("HEAD") else { return false };
+        !self.repo.is_ancestor(of, &head) && rewrite::successor(&self.repo, of, &head, self.base.as_deref()).is_ok_and(|s| s == commit)
     }
 
     // Stops an interactive rebase at the commit so it's edited in the real repo, where other agents can see a rebase is in progress.
@@ -1117,6 +1122,14 @@ fn init_terminal() -> DefaultTerminal {
 fn restore_terminal() {
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
+}
+
+fn rewritten_status(what: &str, short: &str, rewritten: &rewrite::Rewritten) -> String {
+    match &rewritten.followed {
+        None => format!("{what} {short}"),
+        Some(f) if f.already_there => format!("{short} was rewritten as {} meanwhile, which already has your edits", &f.successor[..7]),
+        Some(f) => format!("{short} was rewritten as {} meanwhile – {} that instead", &f.successor[..7], what.to_lowercase()),
+    }
 }
 
 // Borders, commits, an optional "…and N more", a blank line and the key hint.
