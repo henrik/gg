@@ -31,6 +31,12 @@ const DIM: Color = Color::DarkGray;
 const SELECTED_BG: Color = Color::Indexed(237);
 const REMOVED_BG: Color = Color::Indexed(52);
 const ADDED_BG: Color = Color::Indexed(22);
+const WIP: Color = Color::Magenta;
+
+// Optimistic commits whose specs haven't run yet, e.g. "[WIP] Fix the thing".
+fn is_wip(summary: &str) -> bool {
+    summary.trim_start().get(..5).is_some_and(|p| p.eq_ignore_ascii_case("[wip]"))
+}
 
 struct PendingPush {
     rev: String,
@@ -44,6 +50,9 @@ struct PendingPush {
     // Commits on `onto` that we don't have yet, so we must rebase before pushing.
     behind: usize,
     fetch_failed: bool,
+    wip: usize,
+    // Pushing WIP commits takes a second, deliberate confirmation.
+    confirming_wip: bool,
 }
 
 struct App {
@@ -187,8 +196,16 @@ impl App {
 
         self.status = None;
         if self.pending_push.is_some() {
+            let confirming_wip = self.pending_push.as_ref().is_some_and(|p| p.confirming_wip);
             match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => self.push(terminal)?,
+                KeyCode::Char('W') if confirming_wip => self.push(terminal)?,
+                KeyCode::Char('y') | KeyCode::Enter if !confirming_wip => {
+                    if let Some(push) = self.pending_push.as_mut().filter(|p| p.wip > 0) {
+                        push.confirming_wip = true;
+                    } else {
+                        self.push(terminal)?;
+                    }
+                }
                 _ => self.pending_push = None,
             }
             return Ok(false);
@@ -720,8 +737,12 @@ impl App {
         }
         let behind = self.repo.run(&["rev-list", "--count", &format!("{rev}..{onto}")])?.trim().parse().unwrap_or(0);
 
+        let commits: Vec<String> = commits.lines().map(String::from).collect();
+        let wip = commits.iter().filter(|c| is_wip(c.split_once(' ').map_or("", |(_, s)| s))).count();
         let (remote, branch) = onto.split_once('/').unwrap_or(("origin", &onto));
         self.pending_push = Some(PendingPush {
+            wip,
+            confirming_wip: false,
             rev,
             onto: onto.clone(),
             behind,
@@ -729,7 +750,7 @@ impl App {
             remote: remote.to_string(),
             worktree_branch: self.repo.is_linked_worktree().then(|| self.branch.clone().unwrap_or_else(|| "detached HEAD".into())),
             branch: branch.to_string(),
-            commits: commits.lines().map(String::from).collect(),
+            commits,
         });
         Ok(())
     }
@@ -786,6 +807,10 @@ impl App {
         if push.behind > 0 {
             notes.push((format!("{} has {} we don't, so this rebases onto it first", push.onto, commits(push.behind)), Color::Yellow));
         }
+        if push.wip > 0 {
+            let these = if push.wip == 1 { "1 is a WIP commit, whose specs may not have run".to_string() } else { format!("{} are WIP commits, whose specs may not have run", push.wip) };
+            notes.push((format!("Careful: {these}"), WIP));
+        }
         let widest = push.commits.iter().chain(notes.iter().map(|(n, _)| n)).map(|c| c.chars().count()).max().unwrap_or(0);
         let width = (widest as u16 + 4).clamp(44, area.width.saturating_sub(4).max(1));
         let notes_height = if notes.is_empty() { 0 } else { notes.len() + 1 };
@@ -803,13 +828,20 @@ impl App {
         }
         lines.extend(push.commits.iter().take(shown).map(|c| {
             let (hash, summary) = c.split_once(' ').unwrap_or((c, ""));
-            Line::from(vec![hash.to_string().yellow(), Span::raw(format!(" {summary}"))])
+            let mut spans = vec![hash.to_string().yellow(), Span::raw(" ")];
+            spans.extend(summary_spans(summary, Style::new()));
+            Line::from(spans)
         }));
         if shown < push.commits.len() {
             lines.push(Line::from(format!("…and {} more", push.commits.len() - shown)).fg(DIM));
         }
         lines.push(Line::raw(""));
-        lines.push(Line::from(vec!["y".bold().cyan(), Span::raw("/"), "Enter".bold().cyan(), Span::raw(if push.behind > 0 { " rebase and push   any other key cancels" } else { " push   any other key cancels" })]));
+        let action = if push.behind > 0 { "rebase and push" } else { "push" };
+        if push.confirming_wip {
+            lines.push(Line::from(vec!["W".bold().fg(WIP), Span::raw(format!(" really {action}, WIP and all   any other key cancels"))]));
+        } else {
+            lines.push(Line::from(vec!["y".bold().cyan(), Span::raw("/"), "Enter".bold().cyan(), Span::raw(format!(" {action}   any other key cancels"))]));
+        }
 
         let title = format!(" Push {} to {}/{}? ", commits(push.commits.len()), push.remote, push.branch);
         let block = Block::bordered().title(title.bold()).border_style(Style::new().fg(Color::Cyan)).padding(ratatui::widgets::Padding::horizontal(1));
@@ -967,7 +999,11 @@ impl App {
                     second.push(Span::raw(" "));
                 }
                 let summary_style = if c.stale { style(Color::Reset).add_modifier(Modifier::CROSSED_OUT) } else { style(Color::Reset) };
-                second.push(Span::styled(c.summary.clone(), summary_style));
+                if c.pushed || c.stale {
+                    second.push(Span::styled(c.summary.clone(), summary_style));
+                } else {
+                    second.extend(summary_spans(&c.summary, summary_style));
+                }
                 ListItem::new(vec![Line::from(first), Line::from(second)])
             })
             .collect();
@@ -1124,6 +1160,16 @@ fn restore_terminal() {
     ratatui::restore();
 }
 
+// Shows a "[WIP]" prefix as a badge, so those commits stand out.
+fn summary_spans(summary: &str, style: Style) -> Vec<Span<'static>> {
+    if !is_wip(summary) {
+        return vec![Span::styled(summary.to_string(), style)];
+    }
+    let rest = summary.trim_start()[5..].trim_start();
+    let badge = Span::styled(" WIP ", Style::new().fg(Color::Black).bg(WIP).add_modifier(Modifier::BOLD));
+    vec![badge, Span::raw(" "), Span::styled(rest.to_string(), style.fg(WIP))]
+}
+
 fn rewritten_status(what: &str, short: &str, rewritten: &rewrite::Rewritten) -> String {
     match &rewritten.followed {
         None => format!("{what} {short}"),
@@ -1153,6 +1199,14 @@ mod tests {
 
     fn highlighted(line: &Line) -> Vec<String> {
         line.spans.iter().filter(|s| s.style.bg.is_some()).map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn recognises_wip_commits() {
+        assert!(is_wip("[WIP] Fix the thing"));
+        assert!(is_wip("[wip] Fix the thing"));
+        assert!(!is_wip("Fix the [WIP] thing"));
+        assert!(!is_wip("WIP"));
     }
 
     #[test]

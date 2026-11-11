@@ -57,3 +57,13 @@ In `r`, the commit's diff appears below the scissors line, as with `git commit -
 `Ctrl+↑`/`Ctrl+↓` work the same way. They refuse if either commit is pushed or a merge, if a rebase is in progress, or if the two commits aren't independent: the swapped pair must produce exactly the same code as before, so the result at HEAD never changes.
 
 Pushed commits can't be reworded, amended or moved.
+
+### Conventions and assumptions
+
+gg expects these, so tell your agents about the ones that involve them:
+
+- **`[WIP]` commits:** a summary starting with `[WIP]` (any case) marks an optimistic commit that's ready for review but whose specs haven't run yet. gg shows it with a magenta `WIP` badge. If a push includes one, the modal warns about it, and pushing needs a second confirmation with `W` after `y`/`Enter`. Have the agent reword the commit to drop the prefix once its specs pass.
+- **One mainline:** pushes and `b` target `origin`'s default branch (`origin/HEAD`, or else `origin/main` or `origin/master`), and never force.
+- **Worktrees are workspaces:** a linked worktree's branch is treated as a local workspace for that mainline, not as a branch of its own.
+- **Rewritten commits keep their author date:** that's how gg recognises a commit someone else amended or rebased while you were editing it. `git commit --amend` and rebases keep it; a `--reset-author` doesn't.
+- **A Vim-like editor** gets the changed files in tabs, scrolled to the first change. Other editors just get the files.
