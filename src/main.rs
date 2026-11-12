@@ -61,6 +61,8 @@ struct PendingPush {
 struct Explanation {
     hash: String,
     segments: Vec<explain::Segment>,
+    // The hunks it's about, so any it leaves out can be shown after it.
+    scope: Option<usize>,
 }
 
 // An explanation being prepared in the background.
@@ -70,6 +72,7 @@ struct Explaining {
     only: Option<usize>,
     started: Instant,
     receiver: std::sync::mpsc::Receiver<Result<String>>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 // A request to Claude being written, about the selected commit or hunk.
@@ -94,9 +97,10 @@ struct App {
     diff_scroll: usize,
     diff_height: usize,
     diff_width: usize,
-    wrapped: Option<(String, usize, Wrapped)>,
-    // The shown explanation rendered at some width, with the diff's hunks spliced in.
-    explained: Option<(usize, Wrapped)>,
+    // Keyed by hash, width and whether there's a line number gutter.
+    wrapped: Option<(String, usize, bool, Wrapped)>,
+    // The shown explanation rendered like `wrapped`, with the diff's hunks spliced in.
+    explained: Option<(usize, bool, Wrapped)>,
     explanation: Option<Explanation>,
     explaining: Option<Explaining>,
     // Explanation documents by commit and hunk number (None for the whole commit).
@@ -309,7 +313,7 @@ impl App {
             KeyCode::Char('c') => self.start_request(),
             KeyCode::Char('?') => self.start_explaining(),
             KeyCode::Char('!') => self.leave_explanation(),
-            KeyCode::Esc => self.selected_hunk = None,
+            KeyCode::Esc => self.select_hunk(None),
             KeyCode::Char('r') => self.reword(terminal)?,
             KeyCode::Char('b') => self.rebase(terminal)?,
             KeyCode::Char('p') => self.confirm_push(terminal, "HEAD".into())?,
@@ -389,7 +393,7 @@ impl App {
         }
         self.stale_unfocused_at.retain(|hash, _| self.commits.iter().any(|c| c.stale && c.hash == *hash));
         self.diffs.retain(|hash, _| !hash.starts_with("gg:"));
-        if self.wrapped.as_ref().is_some_and(|(hash, _, _)| hash.starts_with("gg:")) {
+        if self.wrapped.as_ref().is_some_and(|(hash, _, _, _)| hash.starts_with("gg:")) {
             self.wrapped = None;
         }
         self.fingerprint = self.repo.fingerprint();
@@ -502,25 +506,26 @@ impl App {
         }
 
         let width = self.diff_width.max(1);
-        if !self.wrapped.as_ref().is_some_and(|(h, w, _)| *h == hash && *w == width) {
-            self.wrapped = Some((hash.clone(), width, wrap(&self.diffs[&hash], width)));
+        let gutter = self.selected_hunk.is_some();
+        if !self.wrapped.as_ref().is_some_and(|(h, w, g, _)| *h == hash && *w == width && *g == gutter) {
+            self.wrapped = Some((hash.clone(), width, gutter, wrap(&self.diffs[&hash], width, gutter)));
             self.explained = None;
         }
-        let (_, _, wrapped) = self.wrapped.as_ref()?;
+        let (_, _, _, wrapped) = self.wrapped.as_ref()?;
 
         let Some(explanation) = self.explanation.as_ref().filter(|e| e.hash == hash) else { return Some(wrapped) };
-        if !self.explained.as_ref().is_some_and(|(w, _)| *w == width) {
-            self.explained = Some((width, render_explanation(&explanation.segments, wrapped)));
+        if !self.explained.as_ref().is_some_and(|(w, g, _)| *w == width && *g == gutter) {
+            self.explained = Some((width, gutter, render_explanation(explanation, wrapped)));
         }
-        self.explained.as_ref().map(|(_, explained)| explained)
+        self.explained.as_ref().map(|(_, _, explained)| explained)
     }
 
     // What's shown in the diff pane as of the last draw: the diff or its explanation.
     fn view(&self) -> Option<&Wrapped> {
         let hash = &self.selected_commit()?.hash;
-        let (wrapped_hash, _, wrapped) = self.wrapped.as_ref().filter(|(h, _, _)| h == hash)?;
+        let (wrapped_hash, _, _, wrapped) = self.wrapped.as_ref().filter(|(h, _, _, _)| h == hash)?;
         match (&self.explanation, &self.explained) {
-            (Some(e), Some((_, explained))) if &e.hash == wrapped_hash => Some(explained),
+            (Some(e), Some((_, _, explained))) if &e.hash == wrapped_hash => Some(explained),
             _ => Some(wrapped),
         }
     }
@@ -537,28 +542,35 @@ impl App {
         let Some(entry) = self.selected_commit().cloned() else { return };
         self.diff();
         let only = self.current_hunk().map(|h| h.number);
-        let Some(diff) = self.wrapped.as_ref().filter(|(h, _, _)| *h == entry.hash).map(|(_, _, w)| w) else { return };
+        let Some(diff) = self.wrapped.as_ref().filter(|(h, _, _, _)| *h == entry.hash).map(|(_, _, _, w)| w) else { return };
+        // Claude gets the whole change even when explaining one hunk, for context.
         let hunks: Vec<explain::HunkInfo> = diff
             .hunks
             .iter()
-            .filter(|h| only.is_none_or(|n| n == h.number))
-            .map(|h| explain::HunkInfo { number: h.number, location: h.description() })
+            .map(|h| explain::HunkInfo { number: h.number, location: h.description(), text: h.text.clone() })
             .collect();
         if hunks.is_empty() {
             self.set_status(format!("{} has nothing to explain", entry.short), true);
             return;
         }
 
+        let short = if entry.kind == Kind::Commit { entry.short.clone() } else { entry.short.to_lowercase() };
+        let what = match entry.kind {
+            Kind::Commit => format!("commit {}", entry.hash),
+            _ => format!("the {short} changes"),
+        };
+        let request = explain::Request { what, hunks, only };
         let key = (entry.hash.clone(), only);
         let (sender, receiver) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         match self.explanations.get(&key) {
             Some(doc) => sender.send(Ok(doc.clone())).unwrap(),
             None => {
-                std::thread::spawn(move || sender.send(explain::placeholder(&hunks)));
+                let (dir, cancel) = (self.repo.dir.clone(), cancel.clone());
+                std::thread::spawn(move || sender.send(explain::explain(&request, &dir, &cancel)));
             }
         }
-        let short = if entry.kind == Kind::Commit { entry.short.clone() } else { entry.short.to_lowercase() };
-        self.explaining = Some(Explaining { hash: entry.hash, short, only, started: Instant::now(), receiver });
+        self.explaining = Some(Explaining { hash: entry.hash, short, only, started: Instant::now(), receiver, cancel });
     }
 
     // Shows the explanation once it's ready, switching to its commit if another one has been selected meanwhile.
@@ -578,7 +590,7 @@ impl App {
             self.explanations.insert((explaining.hash.clone(), explaining.only), doc.clone());
         }
         self.select(index);
-        self.explanation = Some(Explanation { hash: explaining.hash, segments: explain::parse(&doc) });
+        self.explanation = Some(Explanation { hash: explaining.hash, segments: explain::parse(&doc), scope: explaining.only });
         self.explained = None;
         self.diff_scroll = 0;
         self.selected_hunk = None;
@@ -588,6 +600,7 @@ impl App {
     // Aborts an explanation in progress, or else goes back to the plain diff.
     fn leave_explanation(&mut self) {
         if let Some(explaining) = self.explaining.take() {
+            explaining.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             self.set_status(format!("Stopped explaining {}", explaining.short), false);
         } else if self.explanation.take().is_some() {
             self.explained = None;
@@ -612,8 +625,19 @@ impl App {
             None => self.hunks().iter().position(|h| h.end > top),
         };
         if let Some(index) = target.filter(|&i| i < self.hunks().len()) {
-            self.selected_hunk = Some(index);
+            self.select_hunk(Some(index));
             self.diff_scroll = self.hunks()[index].start.min(self.max_scroll());
+        }
+    }
+
+    // Selecting the first hunk or unselecting the last reflows the diff for the line number gutter, so this keeps the hunk where it was on screen.
+    fn select_hunk(&mut self, index: Option<usize>) {
+        let anchor = index.or(self.selected_hunk);
+        let offset = anchor.and_then(|i| self.hunks().get(i)).map(|h| h.start as isize - self.diff_scroll as isize);
+        self.selected_hunk = index;
+        self.diff();
+        if let Some((offset, hunk)) = offset.zip(anchor.and_then(|i| self.hunks().get(i))) {
+            self.diff_scroll = (hunk.start as isize - offset).max(0) as usize;
         }
     }
 
@@ -678,7 +702,7 @@ impl App {
         }
         let row = self.diff_scroll + (row - area.y) as usize;
         if let Some(index) = self.hunks().iter().position(|h| (h.start..h.end).contains(&row)) {
-            self.selected_hunk = Some(index);
+            self.select_hunk(Some(index));
         }
     }
 
@@ -1272,6 +1296,12 @@ impl App {
         self.diff_area = area;
         self.diff_height = inner.height as usize;
         self.diff_width = inner.width as usize;
+
+        // Scrolling the selected hunk out of view unselects it, so the gutter goes away.
+        self.diff();
+        if self.selected_hunk.is_some() && self.current_hunk().is_none() {
+            self.selected_hunk = None;
+        }
         let scroll = self.diff_scroll.min(self.max_scroll());
         self.diff_scroll = scroll;
         let Some(diff) = self.diff() else { return };
@@ -1341,6 +1371,8 @@ struct Hunk {
     lines: (usize, usize),
     // The new version's line number for each row, if it has one.
     numbers: Vec<Option<usize>>,
+    // Unwrapped and without colours, for Claude.
+    text: String,
 }
 
 impl Hunk {
@@ -1358,10 +1390,10 @@ impl Hunk {
 }
 
 // Soft-wraps at exactly `width` columns (less the gutter), so scrolling can count screen rows. Expects paths without "a/" and "b/" prefixes.
-fn wrap(text: &Text<'static>, width: usize) -> Wrapped {
+fn wrap(text: &Text<'static>, width: usize, with_gutter: bool) -> Wrapped {
     let plain_lines: Vec<String> = text.lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
     let last_line = plain_lines.iter().filter(|l| l.starts_with("@@ ")).map(|l| new_lines(l).1).max();
-    let gutter = last_line.map_or(0, |n| n.to_string().len() + 1);
+    let gutter = last_line.filter(|_| with_gutter).map_or(0, |n| n.to_string().len() + 1);
     let width = width.saturating_sub(gutter).max(1);
 
     let mut rows = Vec::with_capacity(text.lines.len());
@@ -1374,7 +1406,7 @@ fn wrap(text: &Text<'static>, width: usize) -> Wrapped {
 
         // A commit's header and message come first, up to the "---" before the diffstat.
         if index == 0 && plain.starts_with("commit ") {
-            hunks.push(Hunk { start: 0, end: 0, number: 0, message: true, path: String::new(), lines: (0, 0), numbers: vec![] });
+            hunks.push(Hunk { start: 0, end: 0, number: 0, message: true, path: String::new(), lines: (0, 0), numbers: vec![], text: String::new() });
             in_hunk = true;
         }
         let ends_message = hunks.len() == 1 && hunks[0].message && in_hunk && (plain == "---" || plain.starts_with("diff "));
@@ -1393,7 +1425,7 @@ fn wrap(text: &Text<'static>, width: usize) -> Wrapped {
             let lines = new_lines(plain);
             next_number = lines.0;
             let number = hunks.len();
-            hunks.push(Hunk { start: rows.len(), end: rows.len(), number, message: false, path: path.clone(), lines, numbers: vec![] });
+            hunks.push(Hunk { start: rows.len(), end: rows.len(), number, message: false, path: path.clone(), lines, numbers: vec![], text: String::new() });
             in_hunk = true;
         } else if in_hunk && !hunks.last().unwrap().message && (plain.starts_with(' ') || plain.starts_with('+')) {
             number = Some(next_number);
@@ -1421,9 +1453,11 @@ fn wrap(text: &Text<'static>, width: usize) -> Wrapped {
         }
         rows.push(Line::from(row).style(line.style));
         if in_hunk {
-            let numbers = &mut hunks.last_mut().unwrap().numbers;
-            numbers.push(number);
-            numbers.resize(numbers.len() + rows.len() - first_row - 1, None);
+            let hunk = hunks.last_mut().unwrap();
+            hunk.numbers.push(number);
+            hunk.numbers.resize(hunk.numbers.len() + rows.len() - first_row - 1, None);
+            hunk.text.push_str(plain);
+            hunk.text.push('\n');
         }
     }
     if in_hunk {
@@ -1433,11 +1467,22 @@ fn wrap(text: &Text<'static>, width: usize) -> Wrapped {
 }
 
 // The explanation's prose, with the diff's hunks spliced in where it refers to them.
-fn render_explanation(segments: &[explain::Segment], diff: &Wrapped) -> Wrapped {
+// Hunks it doesn't place are shown at the end, so nothing goes unreviewed.
+fn render_explanation(explanation: &Explanation, diff: &Wrapped) -> Wrapped {
     let width = diff.text.lines.iter().map(|l| l.width()).max().unwrap_or(80).max(20);
     let mut rows: Vec<Line<'static>> = vec![];
-    let mut hunks = vec![];
-    for segment in segments {
+    let mut hunks: Vec<Hunk> = vec![];
+
+    let placed: Vec<usize> = explanation.segments.iter().filter_map(|s| if let explain::Segment::Hunk(n) = s { Some(*n) } else { None }).collect();
+    let unplaced: Vec<explain::Segment> = diff
+        .hunks
+        .iter()
+        .filter(|h| explanation.scope.is_none_or(|n| n == h.number) && !h.message && !placed.contains(&h.number))
+        .map(|h| explain::Segment::Hunk(h.number))
+        .collect();
+    let heading = (!unplaced.is_empty()).then(|| explain::Segment::Prose("## Not covered above".into()));
+
+    for segment in explanation.segments.iter().chain(heading.iter()).chain(unplaced.iter()) {
         match segment {
             explain::Segment::Prose(text) => {
                 for line in text.lines() {
@@ -1446,6 +1491,9 @@ fn render_explanation(segments: &[explain::Segment], diff: &Wrapped) -> Wrapped 
             }
             explain::Segment::Hunk(number) => {
                 let Some(hunk) = diff.hunks.iter().find(|h| h.number == *number) else { continue };
+                if hunks.iter().any(|h| h.number == *number) {
+                    continue;
+                }
                 rows.push(Line::from(format!("── {}", hunk.description())).fg(DIM));
                 let start = rows.len();
                 rows.extend(diff.text.lines[hunk.start..hunk.end].iter().cloned());
@@ -1463,8 +1511,13 @@ fn render_prose_line(line: &str, width: usize) -> Vec<Line<'static>> {
         return vec![Line::raw("")];
     }
     let heading = line.starts_with('#');
+    let check = line.starts_with("! ");
     let text = if heading { line.trim_start_matches('#').trim_start() } else { line };
-    let base = if heading { Style::new().bold().cyan() } else { Style::new() };
+    let base = match () {
+        _ if heading => Style::new().bold().cyan(),
+        _ if check => Style::new().bold().yellow(),
+        _ => Style::new(),
+    };
 
     let mut spans = vec![];
     for (i, part) in text.split('`').enumerate() {

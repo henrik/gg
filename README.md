@@ -32,7 +32,7 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 | `Ctrl+↑`/`Ctrl+↓` | Move the commit up/down past its neighbour |
 | `j`/`k`, click | Select the next/previous hunk. A commit's message counts as its first hunk. No hunk is selected when you switch commits; the first `j` or `k` selects the first hunk on screen. |
 | `Esc` | Unselect the hunk |
-| `?` | Explain the selected hunk, or the whole commit if none is selected: prose with the hunks spliced in, shown in place of the diff. It loads in the background; gg switches to the commit when it's ready. |
+| `?` | Explain the selected hunk, or the whole commit if none is selected: prose with the hunks spliced in, shown in place of the diff, with hunks it doesn't cover listed at the end. Claude writes it in the background (gg switches to the commit when it's ready), so expect 15–30 seconds. |
 | `!` | Back to the plain diff, or stop an explanation that's loading |
 | `c` | Ask Claude about the selected hunk, or the commit if none is selected |
 | `w` | Toggle hiding whitespace changes in diffs (like `git diff -w`) |
@@ -44,7 +44,7 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 | `P` | Push up to and including the selected commit |
 | `Q`, `Ctrl+C` | Quit |
 
-Pushes fetch first, then ask for confirmation in a modal, and never force. If `origin/main` has moved on, the modal says so and confirming rebases onto it before pushing; if that rebase would conflict, nothing changes and nothing is pushed. In a linked worktree (from `git worktree add`), the worktree's branch is treated as a local workspace for `origin/main`: its own upstream is ignored, and the push dialogue says it pushes straight to `origin/main`. The selected hunk shows line numbers (in the new version of the file). The commit list starts at its narrowest, 30 columns, with each summary wrapped to at most two lines. Drag the vertical separator to resize the panes (each keeps at least 30 columns). gg captures the mouse, so hold Shift (Option in iTerm2) to select text.
+Pushes fetch first, then ask for confirmation in a modal, and never force. If `origin/main` has moved on, the modal says so and confirming rebases onto it before pushing; if that rebase would conflict, nothing changes and nothing is pushed. In a linked worktree (from `git worktree add`), the worktree's branch is treated as a local workspace for `origin/main`: its own upstream is ignored, and the push dialogue says it pushes straight to `origin/main`. The selected hunk shows line numbers (in the new version of the file) in a gutter that's only there while a hunk is selected. The commit list starts at its narrowest, 30 columns, with each summary wrapped to at most two lines. Drag the vertical separator to resize the panes (each keeps at least 30 columns). gg captures the mouse, so hold Shift (Option in iTerm2) to select text.
 
 ### Rewriting safely alongside agents
 
@@ -71,5 +71,6 @@ gg expects these, so tell your agents about the ones that involve them:
 - **Worktrees are workspaces:** a linked worktree's branch is treated as a local workspace for that mainline, not as a branch of its own.
 - **Rewritten commits keep their author date:** that's how gg recognises a commit someone else amended or rebased while you were editing it. `git commit --amend` and rebases keep it; a `--reset-author` doesn't.
 - **[Herdr](https://herdr.dev):** `c` sends something like `Reviewing 4fe92d, src/main.rs:12-20: <your text>` to a Claude in another pane of gg's Herdr tab, or starts `claude` with it in a new split if there's none. Focus stays on gg. Outside Herdr, `c` just says it can't.
+- **Explanations come from a throwaway fork of the neighbouring Claude's session:** `?` runs `claude -p --resume <session> --fork-session` without saving it, so the explanation can draw on why the change was made, and nothing shows up in that Claude's chat. The session is found among Claude Code's sessions for the pane's directory by the conversation title Herdr reports for the pane, or else it's the most recent one. With no Claude in the tab, or outside Herdr, a fresh `claude -p` in the repo is used instead. Either way it may only read files.
 - **No `a/` and `b/` prefixes:** diffs are shown with `--no-prefix`, so file paths can be read straight off them.
 - **A Vim-like editor** gets the changed files in tabs, scrolled to the first change. Other editors just get the files.
