@@ -1,5 +1,6 @@
 mod amend;
 mod claude;
+mod explain;
 mod git;
 mod rewrite;
 
@@ -56,6 +57,21 @@ struct PendingPush {
     confirming_wip: bool,
 }
 
+// The explanation shown instead of the diff of the commit with this hash.
+struct Explanation {
+    hash: String,
+    segments: Vec<explain::Segment>,
+}
+
+// An explanation being prepared in the background.
+struct Explaining {
+    hash: String,
+    short: String,
+    only: Option<usize>,
+    started: Instant,
+    receiver: std::sync::mpsc::Receiver<Result<String>>,
+}
+
 // A request to Claude being written, about the selected commit or hunk.
 struct Request {
     // E.g. "Reviewing 4fe92d, src/main.rs:12-20".
@@ -78,8 +94,13 @@ struct App {
     diff_scroll: usize,
     diff_height: usize,
     diff_width: usize,
-    wrapped: Option<(String, usize, Text<'static>)>,
-    hunks: Vec<Hunk>,
+    wrapped: Option<(String, usize, Wrapped)>,
+    // The shown explanation rendered at some width, with the diff's hunks spliced in.
+    explained: Option<(usize, Wrapped)>,
+    explanation: Option<Explanation>,
+    explaining: Option<Explaining>,
+    // Explanation documents by commit and hunk number (None for the whole commit).
+    explanations: HashMap<(String, Option<usize>), String>,
     // Only while it's in view; none is selected until j or k is pressed.
     selected_hunk: Option<usize>,
     diff_area: ratatui::layout::Rect,
@@ -125,7 +146,10 @@ fn main() -> Result<()> {
         diff_height: 0,
         diff_width: 0,
         wrapped: None,
-        hunks: vec![],
+        explained: None,
+        explanation: None,
+        explaining: None,
+        explanations: HashMap::new(),
         selected_hunk: None,
         diff_area: ratatui::layout::Rect::default(),
         ignore_whitespace: false,
@@ -165,7 +189,9 @@ impl App {
             terminal.draw(|f| self.draw(f))?;
 
             // Handles everything that's queued before redrawing, so bursts of scroll or mouse-move events can't pile up.
-            if event::poll(Duration::from_millis(250))? {
+            // Faster while something's loading, to animate the spinner.
+            let wait = Duration::from_millis(if self.explaining.is_some() { 100 } else { 250 });
+            if event::poll(wait)? {
                 loop {
                     if self.handle_event(event::read()?, terminal)? {
                         return Ok(());
@@ -181,6 +207,7 @@ impl App {
             }
             self.prune_stale();
             self.background_fetch();
+            self.receive_explanation();
             if let Some(result) = self.request_sent.as_ref().and_then(|r| r.try_recv().ok()) {
                 self.request_sent = None;
                 match result {
@@ -280,6 +307,9 @@ impl App {
             KeyCode::Char('k') => self.jump_to_hunk(false),
             KeyCode::Char('w') => self.toggle_whitespace(),
             KeyCode::Char('c') => self.start_request(),
+            KeyCode::Char('?') => self.start_explaining(),
+            KeyCode::Char('!') => self.leave_explanation(),
+            KeyCode::Esc => self.selected_hunk = None,
             KeyCode::Char('r') => self.reword(terminal)?,
             KeyCode::Char('b') => self.rebase(terminal)?,
             KeyCode::Char('p') => self.confirm_push(terminal, "HEAD".into())?,
@@ -382,6 +412,7 @@ impl App {
         if changed {
             self.diff_scroll = 0;
             self.selected_hunk = None;
+            self.explanation = None;
         }
         Ok(())
     }
@@ -423,6 +454,7 @@ impl App {
             self.list.select(Some(index));
             self.diff_scroll = 0;
             self.selected_hunk = None;
+            self.explanation = None;
         }
     }
 
@@ -453,7 +485,7 @@ impl App {
         self.commits.get(self.selected())
     }
 
-    fn diff(&mut self) -> Option<&Text<'static>> {
+    fn diff(&mut self) -> Option<&Wrapped> {
         let entry = self.selected_commit()?.clone();
         let hash = entry.hash.clone();
         if !self.diffs.contains_key(&hash) {
@@ -471,17 +503,103 @@ impl App {
 
         let width = self.diff_width.max(1);
         if !self.wrapped.as_ref().is_some_and(|(h, w, _)| *h == hash && *w == width) {
-            let (text, hunks) = wrap(&self.diffs[&hash], width);
-            self.wrapped = Some((hash.clone(), width, text));
-            self.hunks = hunks;
+            self.wrapped = Some((hash.clone(), width, wrap(&self.diffs[&hash], width)));
+            self.explained = None;
         }
-        self.wrapped.as_ref().map(|(_, _, text)| text)
+        let (_, _, wrapped) = self.wrapped.as_ref()?;
+
+        let Some(explanation) = self.explanation.as_ref().filter(|e| e.hash == hash) else { return Some(wrapped) };
+        if !self.explained.as_ref().is_some_and(|(w, _)| *w == width) {
+            self.explained = Some((width, render_explanation(&explanation.segments, wrapped)));
+        }
+        self.explained.as_ref().map(|(_, explained)| explained)
+    }
+
+    // What's shown in the diff pane as of the last draw: the diff or its explanation.
+    fn view(&self) -> Option<&Wrapped> {
+        let hash = &self.selected_commit()?.hash;
+        let (wrapped_hash, _, wrapped) = self.wrapped.as_ref().filter(|(h, _, _)| h == hash)?;
+        match (&self.explanation, &self.explained) {
+            (Some(e), Some((_, explained))) if &e.hash == wrapped_hash => Some(explained),
+            _ => Some(wrapped),
+        }
+    }
+
+    fn hunks(&self) -> &[Hunk] {
+        self.view().map_or(&[], |v| &v.hunks)
+    }
+
+    fn start_explaining(&mut self) {
+        if let Some(explaining) = &self.explaining {
+            self.set_status(format!("Already explaining {} – ! aborts", explaining.short), true);
+            return;
+        }
+        let Some(entry) = self.selected_commit().cloned() else { return };
+        self.diff();
+        let only = self.current_hunk().map(|h| h.number);
+        let Some(diff) = self.wrapped.as_ref().filter(|(h, _, _)| *h == entry.hash).map(|(_, _, w)| w) else { return };
+        let hunks: Vec<explain::HunkInfo> = diff
+            .hunks
+            .iter()
+            .filter(|h| only.is_none_or(|n| n == h.number))
+            .map(|h| explain::HunkInfo { number: h.number, location: h.description() })
+            .collect();
+        if hunks.is_empty() {
+            self.set_status(format!("{} has nothing to explain", entry.short), true);
+            return;
+        }
+
+        let key = (entry.hash.clone(), only);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        match self.explanations.get(&key) {
+            Some(doc) => sender.send(Ok(doc.clone())).unwrap(),
+            None => {
+                std::thread::spawn(move || sender.send(explain::placeholder(&hunks)));
+            }
+        }
+        let short = if entry.kind == Kind::Commit { entry.short.clone() } else { entry.short.to_lowercase() };
+        self.explaining = Some(Explaining { hash: entry.hash, short, only, started: Instant::now(), receiver });
+    }
+
+    // Shows the explanation once it's ready, switching to its commit if another one has been selected meanwhile.
+    fn receive_explanation(&mut self) {
+        let Some(result) = self.explaining.as_ref().and_then(|e| e.receiver.try_recv().ok()) else { return };
+        let explaining = self.explaining.take().unwrap();
+        let doc = match result {
+            Ok(doc) => doc,
+            Err(e) => return self.set_status(format!("Couldn't explain {}: {e:#}", explaining.short), true),
+        };
+        let Some(index) = self.commits.iter().position(|c| c.hash == explaining.hash) else {
+            return self.set_status(format!("{} is gone, so not showing its explanation", explaining.short), true);
+        };
+
+        // Uncommitted changes change, so their explanations aren't kept.
+        if !explaining.hash.starts_with("gg:") {
+            self.explanations.insert((explaining.hash.clone(), explaining.only), doc.clone());
+        }
+        self.select(index);
+        self.explanation = Some(Explanation { hash: explaining.hash, segments: explain::parse(&doc) });
+        self.explained = None;
+        self.diff_scroll = 0;
+        self.selected_hunk = None;
+        self.set_status("! shows the plain diff again", false);
+    }
+
+    // Aborts an explanation in progress, or else goes back to the plain diff.
+    fn leave_explanation(&mut self) {
+        if let Some(explaining) = self.explaining.take() {
+            self.set_status(format!("Stopped explaining {}", explaining.short), false);
+        } else if self.explanation.take().is_some() {
+            self.explained = None;
+            self.diff_scroll = 0;
+            self.selected_hunk = None;
+        }
     }
 
     // The selected hunk, unless it has been scrolled out of view.
     fn current_hunk(&self) -> Option<&Hunk> {
         let (top, bottom) = (self.diff_scroll, self.diff_scroll + self.diff_height);
-        self.selected_hunk.and_then(|i| self.hunks.get(i)).filter(|h| h.start < bottom && h.end > top)
+        self.selected_hunk.and_then(|i| self.hunks().get(i)).filter(|h| h.start < bottom && h.end > top)
     }
 
     // With no hunk selected, either key selects the first one on screen (or the next one below it).
@@ -491,11 +609,11 @@ impl App {
         let target = match self.current_hunk().and(self.selected_hunk) {
             Some(index) if forward => Some(index + 1),
             Some(index) => index.checked_sub(1),
-            None => self.hunks.iter().position(|h| h.end > top),
+            None => self.hunks().iter().position(|h| h.end > top),
         };
-        if let Some(index) = target.filter(|&i| i < self.hunks.len()) {
+        if let Some(index) = target.filter(|&i| i < self.hunks().len()) {
             self.selected_hunk = Some(index);
-            self.diff_scroll = self.hunks[index].start.min(self.max_scroll());
+            self.diff_scroll = self.hunks()[index].start.min(self.max_scroll());
         }
     }
 
@@ -559,7 +677,7 @@ impl App {
             return;
         }
         let row = self.diff_scroll + (row - area.y) as usize;
-        if let Some(index) = self.hunks.iter().position(|h| (h.start..h.end).contains(&row)) {
+        if let Some(index) = self.hunks().iter().position(|h| (h.start..h.end).contains(&row)) {
             self.selected_hunk = Some(index);
         }
     }
@@ -568,13 +686,14 @@ impl App {
         self.ignore_whitespace = !self.ignore_whitespace;
         self.diffs.clear();
         self.wrapped = None;
+        self.explained = None;
         self.selected_hunk = None;
         self.diff_scroll = 0;
     }
 
     fn max_scroll(&mut self) -> usize {
         let height = self.diff_height;
-        self.diff().map(|t| t.lines.len().saturating_sub(height)).unwrap_or(0)
+        self.diff().map(|d| d.text.lines.len().saturating_sub(height)).unwrap_or(0)
     }
 
     fn set_status(&mut self, message: impl Into<String>, error: bool) {
@@ -1026,6 +1145,9 @@ impl App {
             ("j/k", "hunk"),
             ("w", if self.ignore_whitespace { "show whitespace" } else { "hide whitespace" }),
             ("c", "ask Claude"),
+            ("?", "explain"),
+            ("!", "diff"),
+            ("Esc", "unselect hunk"),
             ("r", "reword"),
             ("a", "amend"),
             ("A", "blocking amend"),
@@ -1069,6 +1191,15 @@ impl App {
         }
         if self.fetch_failed {
             spans.push(Span::raw("  fetch failed").red());
+        }
+        if let Some(explaining) = &self.explaining {
+            const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let frame = SPINNER[(explaining.started.elapsed().as_millis() / 100) as usize % SPINNER.len()];
+            let what = if explaining.only.is_some() { "a hunk of " } else { "" };
+            spans.push(Span::raw(format!("  {frame} Explaining {what}{}… (! stops)", explaining.short)).cyan());
+        } else if self.explanation.as_ref().is_some_and(|e| self.selected_commit().is_some_and(|c| c.hash == e.hash)) {
+            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" EXPLANATION ").bold().black().on_cyan());
         }
         if let Some((message, error)) = &self.status {
             spans.push(Span::raw("   "));
@@ -1143,16 +1274,29 @@ impl App {
         self.diff_width = inner.width as usize;
         let scroll = self.diff_scroll.min(self.max_scroll());
         self.diff_scroll = scroll;
-        let Some(text) = self.diff() else { return };
-        let visible: Vec<Line> = text.lines.iter().skip(scroll).take(inner.height as usize).cloned().collect();
-        frame.render_widget(Paragraph::new(visible), inner);
+        let Some(diff) = self.diff() else { return };
+        let gutter = (diff.gutter as u16).min(inner.width);
+        let visible: Vec<Line> = diff.text.lines.iter().skip(scroll).take(inner.height as usize).cloned().collect();
+        let text_area = ratatui::layout::Rect { x: inner.x + gutter, width: inner.width - gutter, ..inner };
+        frame.render_widget(Paragraph::new(visible), text_area);
 
-        if let Some((start, end)) = self.current_hunk().map(|h| (h.start, h.end)) {
-            let first = start.max(scroll) - scroll;
-            let last = end.min(scroll + inner.height as usize) - scroll;
-            let gutter = ratatui::layout::Rect { y: area.y + first as u16, height: (last - first) as u16, width: 1, ..area };
+        // The selected hunk gets a marker and, for its lines in the new version of the file, line numbers.
+        if let Some(hunk) = self.current_hunk() {
+            let first = hunk.start.max(scroll) - scroll;
+            let last = hunk.end.min(scroll + inner.height as usize) - scroll;
+            let marker_area = ratatui::layout::Rect { y: area.y + first as u16, height: (last - first) as u16, width: 1, ..area };
             let marker: Vec<Line> = (first..last).map(|_| Line::from("▎".cyan())).collect();
-            frame.render_widget(Paragraph::new(marker), gutter);
+            frame.render_widget(Paragraph::new(marker), marker_area);
+
+            let digits = (gutter as usize).saturating_sub(1);
+            let numbers: Vec<Line> = (first..last)
+                .map(|row| match hunk.numbers.get(row + scroll - hunk.start).copied().flatten() {
+                    Some(number) => Line::from(format!("{number:>digits$}")).fg(DIM),
+                    None => Line::raw(""),
+                })
+                .collect();
+            let numbers_area = ratatui::layout::Rect { x: inner.x, width: gutter, ..marker_area };
+            frame.render_widget(Paragraph::new(numbers), numbers_area);
         }
     }
 }
@@ -1175,15 +1319,28 @@ fn pause(message: &str) -> String {
     message.to_string()
 }
 
+// A diff (or an explanation of one) soft-wrapped for display.
+struct Wrapped {
+    text: Text<'static>,
+    hunks: Vec<Hunk>,
+    // Columns to the left of the text for the selected hunk's line numbers.
+    gutter: usize,
+}
+
 // A hunk of the diff, or a commit's message, which can be selected like one.
+#[derive(Clone)]
 struct Hunk {
-    // Rows of the wrapped diff, end exclusive.
+    // Rows of the wrapped text, end exclusive.
     start: usize,
     end: usize,
+    // Its position in the diff, counting a commit's message as 0.
+    number: usize,
     message: bool,
     path: String,
     // Lines in the new version of the file, end inclusive.
     lines: (usize, usize),
+    // The new version's line number for each row, if it has one.
+    numbers: Vec<Option<usize>>,
 }
 
 impl Hunk {
@@ -1194,23 +1351,34 @@ impl Hunk {
             (first, last) => format!("{}:{first}-{last}", self.path),
         }
     }
+
+    fn description(&self) -> String {
+        if self.message { "the commit message".into() } else { self.location() }
+    }
 }
 
-// Soft-wraps at exactly `width` columns, so scrolling can count screen rows. Also returns the hunks. Expects paths without "a/" and "b/" prefixes.
-fn wrap(text: &Text<'static>, width: usize) -> (Text<'static>, Vec<Hunk>) {
+// Soft-wraps at exactly `width` columns (less the gutter), so scrolling can count screen rows. Expects paths without "a/" and "b/" prefixes.
+fn wrap(text: &Text<'static>, width: usize) -> Wrapped {
+    let plain_lines: Vec<String> = text.lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+    let last_line = plain_lines.iter().filter(|l| l.starts_with("@@ ")).map(|l| new_lines(l).1).max();
+    let gutter = last_line.map_or(0, |n| n.to_string().len() + 1);
+    let width = width.saturating_sub(gutter).max(1);
+
     let mut rows = Vec::with_capacity(text.lines.len());
+    let mut next_number = 0;
     let mut hunks: Vec<Hunk> = Vec::new();
     let mut in_hunk = false;
     let (mut old_path, mut path) = (String::new(), String::new());
     for (index, line) in text.lines.iter().enumerate() {
-        let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let plain = &plain_lines[index];
 
         // A commit's header and message come first, up to the "---" before the diffstat.
         if index == 0 && plain.starts_with("commit ") {
-            hunks.push(Hunk { start: 0, end: 0, message: true, path: String::new(), lines: (0, 0) });
+            hunks.push(Hunk { start: 0, end: 0, number: 0, message: true, path: String::new(), lines: (0, 0), numbers: vec![] });
             in_hunk = true;
         }
         let ends_message = hunks.len() == 1 && hunks[0].message && in_hunk && (plain == "---" || plain.starts_with("diff "));
+        let mut number = None;
         if ends_message || in_hunk && (plain.starts_with("@@ ") || plain.starts_with("diff ")) {
             hunks.last_mut().unwrap().end = rows.len();
             in_hunk = false;
@@ -1222,9 +1390,16 @@ fn wrap(text: &Text<'static>, width: usize) -> (Text<'static>, Vec<Hunk>) {
             path = if p == "/dev/null" { old_path.clone() } else { p.to_string() };
         }
         if plain.starts_with("@@ ") {
-            hunks.push(Hunk { start: rows.len(), end: rows.len(), message: false, path: path.clone(), lines: new_lines(&plain) });
+            let lines = new_lines(plain);
+            next_number = lines.0;
+            let number = hunks.len();
+            hunks.push(Hunk { start: rows.len(), end: rows.len(), number, message: false, path: path.clone(), lines, numbers: vec![] });
             in_hunk = true;
+        } else if in_hunk && !hunks.last().unwrap().message && (plain.starts_with(' ') || plain.starts_with('+')) {
+            number = Some(next_number);
+            next_number += 1;
         }
+        let first_row = rows.len();
 
         let mut row: Vec<Span<'static>> = Vec::new();
         let mut row_width = 0;
@@ -1245,11 +1420,58 @@ fn wrap(text: &Text<'static>, width: usize) -> (Text<'static>, Vec<Hunk>) {
             }
         }
         rows.push(Line::from(row).style(line.style));
+        if in_hunk {
+            let numbers = &mut hunks.last_mut().unwrap().numbers;
+            numbers.push(number);
+            numbers.resize(numbers.len() + rows.len() - first_row - 1, None);
+        }
     }
     if in_hunk {
         hunks.last_mut().unwrap().end = rows.len();
     }
-    (Text::from(rows), hunks)
+    Wrapped { text: Text::from(rows), hunks, gutter }
+}
+
+// The explanation's prose, with the diff's hunks spliced in where it refers to them.
+fn render_explanation(segments: &[explain::Segment], diff: &Wrapped) -> Wrapped {
+    let width = diff.text.lines.iter().map(|l| l.width()).max().unwrap_or(80).max(20);
+    let mut rows: Vec<Line<'static>> = vec![];
+    let mut hunks = vec![];
+    for segment in segments {
+        match segment {
+            explain::Segment::Prose(text) => {
+                for line in text.lines() {
+                    rows.extend(render_prose_line(line, width));
+                }
+            }
+            explain::Segment::Hunk(number) => {
+                let Some(hunk) = diff.hunks.iter().find(|h| h.number == *number) else { continue };
+                rows.push(Line::from(format!("── {}", hunk.description())).fg(DIM));
+                let start = rows.len();
+                rows.extend(diff.text.lines[hunk.start..hunk.end].iter().cloned());
+                hunks.push(Hunk { start, end: rows.len(), ..hunk.clone() });
+            }
+        }
+        rows.push(Line::raw(""));
+    }
+    Wrapped { text: Text::from(rows), hunks, gutter: diff.gutter }
+}
+
+// Light Markdown: headings in bold, `code` in yellow, word-wrapped.
+fn render_prose_line(line: &str, width: usize) -> Vec<Line<'static>> {
+    if line.trim().is_empty() {
+        return vec![Line::raw("")];
+    }
+    let heading = line.starts_with('#');
+    let text = if heading { line.trim_start_matches('#').trim_start() } else { line };
+    let base = if heading { Style::new().bold().cyan() } else { Style::new() };
+
+    let mut spans = vec![];
+    for (i, part) in text.split('`').enumerate() {
+        let style = if i % 2 == 1 { base.yellow() } else { base };
+        spans.push(Span::styled(part.to_string(), style));
+    }
+    wrap_words(spans, width, None, "")
 }
 
 // The new file's lines from a header like "@@ -3,2 +4,5 @@". A hunk that only removes lines gives the line they were after.
@@ -1350,13 +1572,18 @@ const SUMMARY_INDENT: &str = "  ";
 
 // Word-wraps the summary to at most two indented lines of `width` columns, ending in "…" if it doesn't fit.
 fn wrap_summary(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
+    wrap_words(spans, width, Some(2), SUMMARY_INDENT)
+}
+
+// Word-wraps to lines of `width` columns plus the indent, ending in "…" if there's a maximum number of lines and it doesn't fit.
+fn wrap_words(spans: Vec<Span<'static>>, width: usize, max_lines: Option<usize>, indent: &'static str) -> Vec<Line<'static>> {
     let chars: Vec<(char, Style)> = spans.iter().flat_map(|s| s.content.chars().map(move |c| (c, s.style))).collect();
     let width = width.max(2);
     let mut lines = vec![];
     let mut rest = &chars[..];
 
     while !rest.is_empty() {
-        let last_line = lines.len() == 1;
+        let last_line = max_lines.is_some_and(|max| lines.len() + 1 == max);
         let fitting = chars_fitting(rest, width);
         let mut line = if fitting == rest.len() {
             std::mem::take(&mut rest).to_vec()
@@ -1390,7 +1617,7 @@ fn wrap_summary(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
                 _ => spans.push(Span::styled(c.to_string(), style)),
             }
         }
-        spans.insert(0, Span::raw(SUMMARY_INDENT));
+        spans.insert(0, Span::raw(indent));
         lines.push(Line::from(spans));
     }
     lines

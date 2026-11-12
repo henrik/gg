@@ -31,6 +31,9 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 | `Home`/`End` | Jump to top/bottom of diff |
 | `Ctrl+↑`/`Ctrl+↓` | Move the commit up/down past its neighbour |
 | `j`/`k`, click | Select the next/previous hunk. A commit's message counts as its first hunk. No hunk is selected when you switch commits; the first `j` or `k` selects the first hunk on screen. |
+| `Esc` | Unselect the hunk |
+| `?` | Explain the selected hunk, or the whole commit if none is selected: prose with the hunks spliced in, shown in place of the diff. It loads in the background; gg switches to the commit when it's ready. |
+| `!` | Back to the plain diff, or stop an explanation that's loading |
 | `c` | Ask Claude about the selected hunk, or the commit if none is selected |
 | `w` | Toggle hiding whitespace changes in diffs (like `git diff -w`) |
 | `r` | Reword (and optionally edit the diff) |
@@ -41,7 +44,7 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 | `P` | Push up to and including the selected commit |
 | `Q`, `Ctrl+C` | Quit |
 
-Pushes fetch first, then ask for confirmation in a modal, and never force. If `origin/main` has moved on, the modal says so and confirming rebases onto it before pushing; if that rebase would conflict, nothing changes and nothing is pushed. In a linked worktree (from `git worktree add`), the worktree's branch is treated as a local workspace for `origin/main`: its own upstream is ignored, and the push dialogue says it pushes straight to `origin/main`. The commit list starts at its narrowest, 30 columns, with each summary wrapped to at most two lines. Drag the vertical separator to resize the panes (each keeps at least 30 columns). gg captures the mouse, so hold Shift (Option in iTerm2) to select text.
+Pushes fetch first, then ask for confirmation in a modal, and never force. If `origin/main` has moved on, the modal says so and confirming rebases onto it before pushing; if that rebase would conflict, nothing changes and nothing is pushed. In a linked worktree (from `git worktree add`), the worktree's branch is treated as a local workspace for `origin/main`: its own upstream is ignored, and the push dialogue says it pushes straight to `origin/main`. The selected hunk shows line numbers (in the new version of the file). The commit list starts at its narrowest, 30 columns, with each summary wrapped to at most two lines. Drag the vertical separator to resize the panes (each keeps at least 30 columns). gg captures the mouse, so hold Shift (Option in iTerm2) to select text.
 
 ### Rewriting safely alongside agents
 
