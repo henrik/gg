@@ -594,7 +594,6 @@ impl App {
         self.explained = None;
         self.diff_scroll = 0;
         self.selected_hunk = None;
-        self.set_status("! shows the plain diff again", false);
     }
 
     // Aborts an explanation in progress, or else goes back to the plain diff.
@@ -1224,6 +1223,7 @@ impl App {
         } else if self.explanation.as_ref().is_some_and(|e| self.selected_commit().is_some_and(|c| c.hash == e.hash)) {
             spans.push(Span::raw("  "));
             spans.push(Span::raw(" EXPLANATION ").bold().black().on_cyan());
+            spans.push(Span::raw(" ! for the diff").fg(DIM));
         }
         if let Some((message, error)) = &self.status {
             spans.push(Span::raw("   "));
