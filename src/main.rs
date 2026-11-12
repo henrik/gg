@@ -507,6 +507,7 @@ impl App {
             Kind::Unstaged => "unstaged changes".into(),
         };
         let context = match self.current_hunk() {
+            Some(hunk) if hunk.message => format!("Reviewing {what}'s commit message"),
             Some(hunk) => format!("Reviewing {what}, {}", hunk.location()),
             None => format!("Reviewing {what}"),
         };
@@ -1174,10 +1175,12 @@ fn pause(message: &str) -> String {
     message.to_string()
 }
 
+// A hunk of the diff, or a commit's message, which can be selected like one.
 struct Hunk {
     // Rows of the wrapped diff, end exclusive.
     start: usize,
     end: usize,
+    message: bool,
     path: String,
     // Lines in the new version of the file, end inclusive.
     lines: (usize, usize),
@@ -1199,9 +1202,16 @@ fn wrap(text: &Text<'static>, width: usize) -> (Text<'static>, Vec<Hunk>) {
     let mut hunks: Vec<Hunk> = Vec::new();
     let mut in_hunk = false;
     let (mut old_path, mut path) = (String::new(), String::new());
-    for line in &text.lines {
+    for (index, line) in text.lines.iter().enumerate() {
         let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        if in_hunk && (plain.starts_with("@@ ") || plain.starts_with("diff ")) {
+
+        // A commit's header and message come first, up to the "---" before the diffstat.
+        if index == 0 && plain.starts_with("commit ") {
+            hunks.push(Hunk { start: 0, end: 0, message: true, path: String::new(), lines: (0, 0) });
+            in_hunk = true;
+        }
+        let ends_message = hunks.len() == 1 && hunks[0].message && in_hunk && (plain == "---" || plain.starts_with("diff "));
+        if ends_message || in_hunk && (plain.starts_with("@@ ") || plain.starts_with("diff ")) {
             hunks.last_mut().unwrap().end = rows.len();
             in_hunk = false;
         }
@@ -1212,7 +1222,7 @@ fn wrap(text: &Text<'static>, width: usize) -> (Text<'static>, Vec<Hunk>) {
             path = if p == "/dev/null" { old_path.clone() } else { p.to_string() };
         }
         if plain.starts_with("@@ ") {
-            hunks.push(Hunk { start: rows.len(), end: rows.len(), path: path.clone(), lines: new_lines(&plain) });
+            hunks.push(Hunk { start: rows.len(), end: rows.len(), message: false, path: path.clone(), lines: new_lines(&plain) });
             in_hunk = true;
         }
 

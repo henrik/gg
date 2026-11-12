@@ -30,7 +30,7 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 | `PgUp`/`PgDn`, mouse wheel | Scroll diff |
 | `Home`/`End` | Jump to top/bottom of diff |
 | `Ctrl+↑`/`Ctrl+↓` | Move the commit up/down past its neighbour |
-| `j`/`k`, click | Select the next/previous hunk. No hunk is selected when you switch commits; the first `j` or `k` selects the first hunk on screen. |
+| `j`/`k`, click | Select the next/previous hunk. A commit's message counts as its first hunk. No hunk is selected when you switch commits; the first `j` or `k` selects the first hunk on screen. |
 | `c` | Ask Claude about the selected hunk, or the commit if none is selected |
 | `w` | Toggle hiding whitespace changes in diffs (like `git diff -w`) |
 | `r` | Reword (and optionally edit the diff) |
