@@ -25,6 +25,7 @@ pub struct Commit {
     pub hash: String,
     pub short: String,
     pub date: String,
+    pub timestamp: i64,
     pub authors: Vec<String>,
     pub summary: String,
     pub pushed: bool,
@@ -40,6 +41,7 @@ impl Commit {
             hash: format!("gg:{}", label.to_lowercase()),
             short: label.into(),
             date: String::new(),
+            timestamp: 0,
             authors: authors.to_vec(),
             summary,
             pushed: false,
@@ -182,8 +184,9 @@ impl Repo {
             None => HashSet::new(),
         };
         let limit = format!("--max-count={}", unpushed.len() + extra_pushed);
-        let format = "--format=%H%x00%h%x00%ad%x00%an%x00%s%x00%(trailers:key=Co-authored-by,valueonly,separator=%x1f)%x1e";
-        let out = self.run(&["log", "--topo-order", &limit, "--date=format:%Y-%m-%d %H:%M", format, "HEAD"])?;
+        let format = "--format=%H%x00%h%x00%ad%x00%an%x00%s%x00%at%x00%(trailers:key=Co-authored-by,valueonly,separator=%x1f)%x1e";
+        // Git lengthens a hash beyond 6 characters where that's needed to make it unique.
+        let out = self.run(&["log", "--topo-order", "--abbrev=6", &limit, "--date=format:%Y-%m-%d %H:%M", format, "HEAD"])?;
 
         Ok(out
             .split('\x1e')
@@ -192,7 +195,7 @@ impl Repo {
             .map(|record| {
                 let f: Vec<&str> = record.split('\0').collect();
                 let mut authors = vec![f[3].to_string()];
-                for co in f.get(5).unwrap_or(&"").split('\x1f') {
+                for co in f.get(6).unwrap_or(&"").split('\x1f') {
                     let name = co.split('<').next().unwrap_or("").trim();
                     if !name.is_empty() && !authors.iter().any(|a| a == name) {
                         authors.push(name.to_string());
@@ -203,6 +206,7 @@ impl Repo {
                     hash: f[0].to_string(),
                     short: f[1].to_string(),
                     date: f[2].to_string(),
+                    timestamp: f[5].parse().unwrap_or(0),
                     authors,
                     summary: f[4].to_string(),
                     pushed: base.is_some() && !unpushed.contains(f[0]),

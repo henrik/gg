@@ -963,6 +963,7 @@ impl App {
     fn draw_commits(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
         self.commits_area = area;
         let base_hash = self.base_hash.clone();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
         let items: Vec<ListItem> = self
             .commits
             .iter()
@@ -972,7 +973,7 @@ impl App {
                     let first = Line::from(vec![
                         Span::styled(format!(" {} ", c.short.to_uppercase()), Style::new().fg(Color::Black).bg(badge).add_modifier(Modifier::BOLD)),
                         Span::raw(" "),
-                        Span::styled(c.authors.join(", "), Style::new().fg(Color::Green)),
+                        Span::styled(abbreviate_authors(&c.authors), Style::new().fg(Color::Green)),
                     ]);
                     let second = Line::from(Span::styled(format!("  {}", c.summary), Style::new().fg(badge).add_modifier(Modifier::ITALIC)));
                     return ListItem::new(vec![first, second]);
@@ -987,9 +988,9 @@ impl App {
                 first.extend([
                     Span::styled(c.short.clone(), style(Color::Yellow)),
                     Span::raw(" "),
-                    Span::styled(c.date.clone(), style(Color::Blue)),
+                    Span::styled(compact_date(c, now), style(Color::Blue)),
                     Span::raw(" "),
-                    Span::styled(c.authors.join(", "), style(Color::Green)),
+                    Span::styled(abbreviate_authors(&c.authors), style(Color::Green)),
                 ]);
                 let mut second = vec![Span::raw("  ")];
                 if base_hash.as_deref() == Some(c.hash.as_str())
@@ -1160,6 +1161,27 @@ fn restore_terminal() {
     ratatui::restore();
 }
 
+// Just the time for commits from the last 24 hours. The date is formatted like "2026-11-12 14:05".
+fn compact_date(commit: &Commit, now: i64) -> String {
+    let recent = (0..24 * 60 * 60).contains(&(now - commit.timestamp));
+    match commit.date.split_once(' ') {
+        Some((_, time)) if recent => time.to_string(),
+        _ => commit.date.clone(),
+    }
+}
+
+// E.g. "Henrik Nyh" becomes "HN". Claude is kept as is, since its co-author name includes a model like "Claude Opus 5.5".
+fn abbreviate_authors(authors: &[String]) -> String {
+    let abbreviate = |name: &String| {
+        if name.split_whitespace().next() == Some("Claude") {
+            return "Claude".to_string();
+        }
+        let initials: String = name.split_whitespace().filter_map(|w| w.chars().next()).filter(|c| c.is_alphabetic()).flat_map(char::to_uppercase).collect();
+        if initials.is_empty() { name.clone() } else { initials }
+    };
+    authors.iter().map(abbreviate).collect::<Vec<_>>().join(", ")
+}
+
 // Shows a "[WIP]" prefix as a badge, so those commits stand out.
 fn summary_spans(summary: &str, style: Style) -> Vec<Span<'static>> {
     if !is_wip(summary) {
@@ -1199,6 +1221,12 @@ mod tests {
 
     fn highlighted(line: &Line) -> Vec<String> {
         line.spans.iter().filter(|s| s.style.bg.is_some()).map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn abbreviates_authors() {
+        let authors = ["Henrik Nyh".to_string(), "Claude Opus 5.5".to_string(), "Anna-Karin von Ekholm".to_string(), "bot".to_string()];
+        assert_eq!(abbreviate_authors(&authors), "HN, Claude, AVE, B");
     }
 
     #[test]
