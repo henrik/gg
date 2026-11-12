@@ -1170,16 +1170,16 @@ fn compact_date(commit: &Commit, now: i64) -> String {
     }
 }
 
-// E.g. "Henrik Nyh" becomes "HN". Claude is kept as is, since its co-author name includes a model like "Claude Opus 5.5".
+// E.g. "HN + CC" for Henrik Nyh with Claude (Code) as co-author, whose name includes a model like "Claude Opus 5.5".
 fn abbreviate_authors(authors: &[String]) -> String {
     let abbreviate = |name: &String| {
         if name.split_whitespace().next() == Some("Claude") {
-            return "Claude".to_string();
+            return "CC".to_string();
         }
         let initials: String = name.split_whitespace().filter_map(|w| w.chars().next()).filter(|c| c.is_alphabetic()).flat_map(char::to_uppercase).collect();
         if initials.is_empty() { name.clone() } else { initials }
     };
-    authors.iter().map(abbreviate).collect::<Vec<_>>().join(", ")
+    authors.iter().map(abbreviate).collect::<Vec<_>>().join(" + ")
 }
 
 // Shows a "[WIP]" prefix as a badge, so those commits stand out.
@@ -1226,7 +1226,7 @@ mod tests {
     #[test]
     fn abbreviates_authors() {
         let authors = ["Henrik Nyh".to_string(), "Claude Opus 5.5".to_string(), "Anna-Karin von Ekholm".to_string(), "bot".to_string()];
-        assert_eq!(abbreviate_authors(&authors), "HN, Claude, AVE, B");
+        assert_eq!(abbreviate_authors(&authors), "HN + CC + AVE + B");
     }
 
     #[test]
