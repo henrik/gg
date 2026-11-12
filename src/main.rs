@@ -76,6 +76,8 @@ struct App {
     jumped_to_hunk: Option<usize>,
     ignore_whitespace: bool,
     commits_area: ratatui::layout::Rect,
+    // Rows each entry in the list takes, as last drawn.
+    item_heights: Vec<usize>,
     pending_push: Option<PendingPush>,
     // Set once the user drags the separator.
     list_width: Option<u16>,
@@ -115,6 +117,7 @@ fn main() -> Result<()> {
         jumped_to_hunk: None,
         ignore_whitespace: false,
         commits_area: ratatui::layout::Rect::default(),
+        item_heights: Vec::new(),
         pending_push: None,
         list_width: None,
         dragging_separator: false,
@@ -385,10 +388,13 @@ impl App {
             return;
         }
 
-        // Each commit takes two rows.
-        let index = self.list.offset() + (row - area.y) as usize / 2;
-        if index < self.commits.len() {
-            self.select(index);
+        let mut top = area.y as usize;
+        for index in self.list.offset()..self.commits.len() {
+            top += self.item_heights.get(index).copied().unwrap_or(2);
+            if (row as usize) < top {
+                self.select(index);
+                return;
+            }
         }
     }
 
@@ -895,7 +901,7 @@ impl App {
         let [header, main, footer] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
         self.main_area = main;
-        let list_width = clamp_list_width(self.list_width.unwrap_or((main.width * 2 / 5).min(60)), main.width);
+        let list_width = clamp_list_width(self.list_width.unwrap_or(MIN_PANE_WIDTH), main.width);
         let [left, right] = Layout::horizontal([Constraint::Length(list_width), Constraint::Min(0)]).areas(main);
 
         self.draw_header(frame, header);
@@ -962,6 +968,7 @@ impl App {
 
     fn draw_commits(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
         self.commits_area = area;
+        let summary_width = area.width.saturating_sub(1 + SUMMARY_INDENT.len() as u16) as usize;
         let base_hash = self.base_hash.clone();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
         let items: Vec<ListItem> = self
@@ -975,8 +982,8 @@ impl App {
                         Span::raw(" "),
                         Span::styled(abbreviate_authors(&c.authors), Style::new().fg(Color::Green)),
                     ]);
-                    let second = Line::from(Span::styled(format!("  {}", c.summary), Style::new().fg(badge).add_modifier(Modifier::ITALIC)));
-                    return ListItem::new(vec![first, second]);
+                    let summary = vec![Span::styled(c.summary.clone(), Style::new().fg(badge).add_modifier(Modifier::ITALIC))];
+                    return ListItem::new([vec![first], wrap_summary(summary, summary_width)].concat());
                 }
 
                 let style = |color: Color| Style::new().fg(if c.pushed || c.stale { DIM } else { color });
@@ -992,7 +999,7 @@ impl App {
                     Span::raw(" "),
                     Span::styled(abbreviate_authors(&c.authors), style(Color::Green)),
                 ]);
-                let mut second = vec![Span::raw("  ")];
+                let mut second = vec![];
                 if base_hash.as_deref() == Some(c.hash.as_str())
                     && let Some(base) = &self.base
                 {
@@ -1005,9 +1012,10 @@ impl App {
                 } else {
                     second.extend(summary_spans(&c.summary, summary_style));
                 }
-                ListItem::new(vec![Line::from(first), Line::from(second)])
+                ListItem::new([vec![Line::from(first)], wrap_summary(second, summary_width)].concat())
             })
             .collect();
+        self.item_heights = items.iter().map(ListItem::height).collect();
 
         let list = List::new(items)
             .block(Block::new().borders(Borders::RIGHT).border_style(Style::new().fg(DIM)))
@@ -1182,6 +1190,65 @@ fn abbreviate_authors(authors: &[String]) -> String {
     authors.iter().map(abbreviate).collect::<Vec<_>>().join(" + ")
 }
 
+const SUMMARY_INDENT: &str = "  ";
+
+// Word-wraps the summary to at most two indented lines of `width` columns, ending in "…" if it doesn't fit.
+fn wrap_summary(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
+    let chars: Vec<(char, Style)> = spans.iter().flat_map(|s| s.content.chars().map(move |c| (c, s.style))).collect();
+    let width = width.max(2);
+    let mut lines = vec![];
+    let mut rest = &chars[..];
+
+    while !rest.is_empty() {
+        let last_line = lines.len() == 1;
+        let fitting = chars_fitting(rest, width);
+        let mut line = if fitting == rest.len() {
+            std::mem::take(&mut rest).to_vec()
+        } else if last_line {
+            let mut line = rest[..chars_fitting(rest, width - 1)].to_vec();
+            while line.last().is_some_and(|(c, _)| c.is_whitespace()) {
+                line.pop();
+            }
+            let style = line.last().map_or(Style::new(), |(_, s)| *s);
+            line.push(('…', style));
+            rest = &[];
+            line
+        } else {
+            // Break at the last space that fits, or mid-word if there's none.
+            let split = rest[..=fitting].iter().rposition(|(c, _)| *c == ' ').filter(|&i| i > 0).unwrap_or(fitting);
+            let line = rest[..split].to_vec();
+            rest = &rest[split..];
+            while rest.first().is_some_and(|(c, _)| *c == ' ') {
+                rest = &rest[1..];
+            }
+            line
+        };
+        while line.last().is_some_and(|(c, _)| *c == ' ') {
+            line.pop();
+        }
+
+        let mut spans: Vec<Span> = vec![];
+        for (c, style) in line {
+            match spans.last_mut() {
+                Some(span) if span.style == style => span.content.to_mut().push(c),
+                _ => spans.push(Span::styled(c.to_string(), style)),
+            }
+        }
+        spans.insert(0, Span::raw(SUMMARY_INDENT));
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+// How many of the characters fit in `width` columns.
+fn chars_fitting(chars: &[(char, Style)], width: usize) -> usize {
+    let mut used = 0;
+    chars.iter().take_while(|(c, _)| {
+        used += c.width().unwrap_or(0);
+        used <= width
+    }).count()
+}
+
 // Shows a "[WIP]" prefix as a badge, so those commits stand out.
 fn summary_spans(summary: &str, style: Style) -> Vec<Span<'static>> {
     if !is_wip(summary) {
@@ -1221,6 +1288,15 @@ mod tests {
 
     fn highlighted(line: &Line) -> Vec<String> {
         line.spans.iter().filter(|s| s.style.bg.is_some()).map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn wraps_summary_to_two_lines_with_ellipsis() {
+        let text = |lines: Vec<Line>| lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        assert_eq!(text(wrap_summary(vec![Span::raw("Short")], 10)), ["  Short"]);
+        assert_eq!(text(wrap_summary(vec![Span::raw("Fix the thing well")], 10)), ["  Fix the", "  thing well"]);
+        assert_eq!(text(wrap_summary(vec![Span::raw("Fix the thing very nicely indeed")], 10)), ["  Fix the", "  thing ver…"]);
+        assert_eq!(text(wrap_summary(vec![Span::raw("Supercalifragilistics")], 10)), ["  Supercalif", "  ragilisti…"]);
     }
 
     #[test]

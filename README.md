@@ -40,7 +40,7 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 | `P` | Push up to and including the selected commit |
 | `Q`, `Ctrl+C` | Quit |
 
-Pushes fetch first, then ask for confirmation in a modal, and never force. If `origin/main` has moved on, the modal says so and confirming rebases onto it before pushing; if that rebase would conflict, nothing changes and nothing is pushed. In a linked worktree (from `git worktree add`), the worktree's branch is treated as a local workspace for `origin/main`: its own upstream is ignored, and the push dialogue says it pushes straight to `origin/main`. Drag the vertical separator to resize the panes (each keeps at least 30 columns). gg captures the mouse, so hold Shift (Option in iTerm2) to select text.
+Pushes fetch first, then ask for confirmation in a modal, and never force. If `origin/main` has moved on, the modal says so and confirming rebases onto it before pushing; if that rebase would conflict, nothing changes and nothing is pushed. In a linked worktree (from `git worktree add`), the worktree's branch is treated as a local workspace for `origin/main`: its own upstream is ignored, and the push dialogue says it pushes straight to `origin/main`. The commit list starts at its narrowest, 30 columns, with each summary wrapped to at most two lines. Drag the vertical separator to resize the panes (each keeps at least 30 columns). gg captures the mouse, so hold Shift (Option in iTerm2) to select text.
 
 ### Rewriting safely alongside agents
 
