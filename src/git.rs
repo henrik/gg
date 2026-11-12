@@ -293,13 +293,13 @@ impl Repo {
         let whitespace: &[&str] = if ignore_whitespace { &["--ignore-all-space"] } else { &[] };
         match entry.kind {
             Kind::Commit => self.show(&entry.hash, whitespace),
-            Kind::Staged => self.run_bytes(&[&["diff", "--cached", "--color=always", "--stat", "--patch"], whitespace].concat(), None),
+            Kind::Staged => self.run_bytes(&[&["diff", "--cached", "--color=always", "--no-prefix", "--stat", "--patch"], whitespace].concat(), None),
             Kind::Unstaged => {
-                let mut out = self.run_bytes(&[&["diff", "--color=always", "--stat", "--patch"], whitespace].concat(), None)?;
+                let mut out = self.run_bytes(&[&["diff", "--color=always", "--no-prefix", "--stat", "--patch"], whitespace].concat(), None)?;
                 let untracked = self.untracked();
                 for path in untracked.iter().take(MAX_UNTRACKED_DIFFS) {
                     // Exits with 1 when there are differences, which there always are.
-                    let diff = self.command().args(["diff", "--color=always", "--no-index", "--", "/dev/null", path]).output()?;
+                    let diff = self.command().args(["diff", "--color=always", "--no-prefix", "--no-index", "--", "/dev/null", path]).output()?;
                     out.push(b'\n');
                     out.extend_from_slice(&diff.stdout);
                 }
@@ -313,7 +313,7 @@ impl Repo {
 
     fn show(&self, hash: &str, extra_args: &[&str]) -> Result<Vec<u8>> {
         let format = "--format=%C(yellow)commit %H%C(reset)%nAuthor: %an <%ae>%nDate:   %ad%n%n%B";
-        self.run_bytes(&[&["show", "--color=always", "--stat", "--patch", format], extra_args, &[hash]].concat(), None)
+        self.run_bytes(&[&["show", "--color=always", "--no-prefix", "--stat", "--patch", format], extra_args, &[hash]].concat(), None)
     }
 
     pub fn message(&self, hash: &str) -> Result<String> {

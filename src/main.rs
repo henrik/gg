@@ -1,4 +1,5 @@
 mod amend;
+mod claude;
 mod git;
 mod rewrite;
 
@@ -8,7 +9,7 @@ use git::{Commit, Kind, Repo};
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::{
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
+        event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
         execute,
     },
     layout::{Constraint, Layout},
@@ -55,6 +56,13 @@ struct PendingPush {
     confirming_wip: bool,
 }
 
+// A request to Claude being written, about the selected commit or hunk.
+struct Request {
+    // E.g. "Reviewing 4fe92d, src/main.rs:12-20".
+    context: String,
+    text: String,
+}
+
 struct App {
     repo: Repo,
     branch: Option<String>,
@@ -71,14 +79,18 @@ struct App {
     diff_height: usize,
     diff_width: usize,
     wrapped: Option<(String, usize, Text<'static>)>,
-    // Row ranges (end exclusive) of the wrapped diff's hunks.
-    hunks: Vec<(usize, usize)>,
-    jumped_to_hunk: Option<usize>,
+    hunks: Vec<Hunk>,
+    // Only while it's in view; none is selected until j or k is pressed.
+    selected_hunk: Option<usize>,
+    diff_area: ratatui::layout::Rect,
     ignore_whitespace: bool,
     commits_area: ratatui::layout::Rect,
     // Rows each entry in the list takes, as last drawn.
     item_heights: Vec<usize>,
     pending_push: Option<PendingPush>,
+    request: Option<Request>,
+    // The outcome of sending a request to Claude, which happens in the background.
+    request_sent: Option<std::sync::mpsc::Receiver<Result<String>>>,
     // Set once the user drags the separator.
     list_width: Option<u16>,
     dragging_separator: bool,
@@ -114,11 +126,14 @@ fn main() -> Result<()> {
         diff_width: 0,
         wrapped: None,
         hunks: vec![],
-        jumped_to_hunk: None,
+        selected_hunk: None,
+        diff_area: ratatui::layout::Rect::default(),
         ignore_whitespace: false,
         commits_area: ratatui::layout::Rect::default(),
         item_heights: Vec::new(),
         pending_push: None,
+        request: None,
+        request_sent: None,
         list_width: None,
         dragging_separator: false,
         stale_unfocused_at: HashMap::new(),
@@ -166,12 +181,24 @@ impl App {
             }
             self.prune_stale();
             self.background_fetch();
+            if let Some(result) = self.request_sent.as_ref().and_then(|r| r.try_recv().ok()) {
+                self.request_sent = None;
+                match result {
+                    Ok(message) => self.set_status(message, false),
+                    Err(e) => self.set_status(format!("{e:#}"), true),
+                }
+            }
         }
     }
 
     // Returns true to quit.
     fn handle_event(&mut self, event: Event, terminal: &mut DefaultTerminal) -> Result<bool> {
         let key = match event {
+            Event::Paste(text) if self.request.is_some() => {
+                self.request.as_mut().unwrap().text.push_str(&text.split_whitespace().collect::<Vec<_>>().join(" "));
+                return Ok(false);
+            }
+            Event::Mouse(_) if self.request.is_some() => return Ok(false),
             Event::Key(key) => key,
             Event::Mouse(_) if self.pending_push.is_some() => return Ok(false),
             Event::Mouse(mouse) => {
@@ -181,7 +208,10 @@ impl App {
                     MouseEventKind::Down(MouseButton::Left) if self.on_separator(mouse.column, mouse.row) => {
                         self.dragging_separator = true;
                     }
-                    MouseEventKind::Down(MouseButton::Left) => self.click_commit(mouse.column, mouse.row),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.click_commit(mouse.column, mouse.row);
+                        self.click_diff(mouse.column, mouse.row);
+                    }
                     MouseEventKind::Drag(MouseButton::Left) if self.dragging_separator => {
                         let main = self.main_area;
                         self.list_width = Some(clamp_list_width(mouse.column.saturating_sub(main.x) + 1, main.width));
@@ -198,6 +228,26 @@ impl App {
         }
 
         self.status = None;
+        if let Some(request) = &mut self.request {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Esc => self.request = None,
+                KeyCode::Enter if request.text.trim().is_empty() => self.request = None,
+                KeyCode::Enter => self.send_request(),
+                KeyCode::Char('u') if ctrl => request.text.clear(),
+                KeyCode::Char('w') if ctrl => {
+                    let kept = request.text.trim_end().rfind(' ').map_or(0, |i| i + 1);
+                    request.text.truncate(kept);
+                }
+                KeyCode::Char('c') if ctrl => self.request = None,
+                KeyCode::Char(c) => request.text.push(c),
+                KeyCode::Backspace => {
+                    request.text.pop();
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
         if self.pending_push.is_some() {
             let confirming_wip = self.pending_push.as_ref().is_some_and(|p| p.confirming_wip);
             match key.code {
@@ -229,6 +279,7 @@ impl App {
             KeyCode::Char('j') => self.jump_to_hunk(true),
             KeyCode::Char('k') => self.jump_to_hunk(false),
             KeyCode::Char('w') => self.toggle_whitespace(),
+            KeyCode::Char('c') => self.start_request(),
             KeyCode::Char('r') => self.reword(terminal)?,
             KeyCode::Char('b') => self.rebase(terminal)?,
             KeyCode::Char('p') => self.confirm_push(terminal, "HEAD".into())?,
@@ -330,7 +381,7 @@ impl App {
         self.list.select(Some(index.min(self.commits.len().saturating_sub(1))));
         if changed {
             self.diff_scroll = 0;
-            self.jumped_to_hunk = None;
+            self.selected_hunk = None;
         }
         Ok(())
     }
@@ -371,7 +422,7 @@ impl App {
         if index != self.selected() {
             self.list.select(Some(index));
             self.diff_scroll = 0;
-            self.jumped_to_hunk = None;
+            self.selected_hunk = None;
         }
     }
 
@@ -427,30 +478,88 @@ impl App {
         self.wrapped.as_ref().map(|(_, _, text)| text)
     }
 
-    // The hunk last jumped to while it's still in view, or else the last hunk in view.
-    fn current_hunk(&self) -> Option<usize> {
+    // The selected hunk, unless it has been scrolled out of view.
+    fn current_hunk(&self) -> Option<&Hunk> {
         let (top, bottom) = (self.diff_scroll, self.diff_scroll + self.diff_height);
-        let in_view = |&(start, end): &(usize, usize)| start < bottom && end > top;
-        if let Some(index) = self.jumped_to_hunk
-            && self.hunks.get(index).is_some_and(in_view)
-        {
-            return Some(index);
-        }
-        self.hunks.iter().rposition(in_view)
+        self.selected_hunk.and_then(|i| self.hunks.get(i)).filter(|h| h.start < bottom && h.end > top)
     }
 
+    // With no hunk selected, either key selects the first one on screen (or the next one below it).
     fn jump_to_hunk(&mut self, forward: bool) {
         self.diff();
         let top = self.diff_scroll;
-        let target = match self.current_hunk() {
+        let target = match self.current_hunk().and(self.selected_hunk) {
             Some(index) if forward => Some(index + 1),
             Some(index) => index.checked_sub(1),
-            None if forward => self.hunks.iter().position(|&(start, _)| start >= top),
-            None => self.hunks.iter().rposition(|&(_, end)| end <= top),
+            None => self.hunks.iter().position(|h| h.end > top),
         };
         if let Some(index) = target.filter(|&i| i < self.hunks.len()) {
-            self.jumped_to_hunk = Some(index);
-            self.diff_scroll = self.hunks[index].0.min(self.max_scroll());
+            self.selected_hunk = Some(index);
+            self.diff_scroll = self.hunks[index].start.min(self.max_scroll());
+        }
+    }
+
+    fn start_request(&mut self) {
+        let Some(entry) = self.selected_commit().cloned() else { return };
+        let what = match entry.kind {
+            Kind::Commit => entry.short.clone(),
+            Kind::Staged => "staged changes".into(),
+            Kind::Unstaged => "unstaged changes".into(),
+        };
+        let context = match self.current_hunk() {
+            Some(hunk) => format!("Reviewing {what}, {}", hunk.location()),
+            None => format!("Reviewing {what}"),
+        };
+        self.request = Some(Request { context, text: String::new() });
+    }
+
+    fn send_request(&mut self) {
+        let Some(request) = self.request.take() else { return };
+        let prompt = format!("{}: {}", request.context, request.text.trim());
+        let (cwd, wide) = (self.repo.dir.clone(), self.main_area.width >= self.main_area.height * 3);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sender.send(claude::send(&prompt, &cwd, wide)));
+        self.request_sent = Some(receiver);
+        self.set_status("Sending to Claude…", false);
+    }
+
+    fn draw_request(&self, frame: &mut Frame) {
+        let Some(request) = &self.request else { return };
+        let area = frame.area();
+        let width = (area.width * 3 / 4).clamp(40.min(area.width), area.width);
+        let inner_width = width.saturating_sub(4).max(1) as usize;
+        let text = format!("{}▏", request.text);
+        let rows = |s: &str| s.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() / inner_width + 1;
+        let height = ((rows(&request.context) + rows(&text) + 4) as u16).min(area.height);
+        let modal = ratatui::layout::Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+
+        let lines = vec![
+            Line::from(request.context.clone()).fg(DIM),
+            Line::raw(text),
+            Line::raw(""),
+            Line::from(vec!["Enter".bold().cyan(), Span::raw(" send   "), "Esc".bold().cyan(), Span::raw(" cancel")]),
+        ];
+        let block = Block::bordered()
+            .title(" Ask Claude ".bold())
+            .border_style(Style::new().fg(Color::Cyan))
+            .padding(ratatui::widgets::Padding::horizontal(1));
+        frame.render_widget(ratatui::widgets::Clear, modal);
+        frame.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }).block(block), modal);
+    }
+
+    fn click_diff(&mut self, column: u16, row: u16) {
+        let area = self.diff_area;
+        if !area.contains(ratatui::layout::Position { x: column, y: row }) {
+            return;
+        }
+        let row = self.diff_scroll + (row - area.y) as usize;
+        if let Some(index) = self.hunks.iter().position(|h| (h.start..h.end).contains(&row)) {
+            self.selected_hunk = Some(index);
         }
     }
 
@@ -458,7 +567,7 @@ impl App {
         self.ignore_whitespace = !self.ignore_whitespace;
         self.diffs.clear();
         self.wrapped = None;
-        self.jumped_to_hunk = None;
+        self.selected_hunk = None;
         self.diff_scroll = 0;
     }
 
@@ -915,6 +1024,7 @@ impl App {
             ("Home/End", "top/end"),
             ("j/k", "hunk"),
             ("w", if self.ignore_whitespace { "show whitespace" } else { "hide whitespace" }),
+            ("c", "ask Claude"),
             ("r", "reword"),
             ("a", "amend"),
             ("A", "blocking amend"),
@@ -929,6 +1039,7 @@ impl App {
             .collect();
         frame.render_widget(Line::from(legend).on_black(), footer);
         self.draw_push_modal(frame);
+        self.draw_request(frame);
     }
 
     fn draw_header(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
@@ -1026,6 +1137,7 @@ impl App {
 
     fn draw_diff(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let inner = ratatui::layout::Rect { x: area.x + 1, width: area.width.saturating_sub(1), ..area };
+        self.diff_area = area;
         self.diff_height = inner.height as usize;
         self.diff_width = inner.width as usize;
         let scroll = self.diff_scroll.min(self.max_scroll());
@@ -1034,7 +1146,7 @@ impl App {
         let visible: Vec<Line> = text.lines.iter().skip(scroll).take(inner.height as usize).cloned().collect();
         frame.render_widget(Paragraph::new(visible), inner);
 
-        if let Some((start, end)) = self.current_hunk().map(|i| self.hunks[i]) {
+        if let Some((start, end)) = self.current_hunk().map(|h| (h.start, h.end)) {
             let first = start.max(scroll) - scroll;
             let last = end.min(scroll + inner.height as usize) - scroll;
             let gutter = ratatui::layout::Rect { y: area.y + first as u16, height: (last - first) as u16, width: 1, ..area };
@@ -1062,19 +1174,45 @@ fn pause(message: &str) -> String {
     message.to_string()
 }
 
-// Soft-wraps at exactly `width` columns, so scrolling can count screen rows. Also returns the row ranges of hunks.
-fn wrap(text: &Text<'static>, width: usize) -> (Text<'static>, Vec<(usize, usize)>) {
+struct Hunk {
+    // Rows of the wrapped diff, end exclusive.
+    start: usize,
+    end: usize,
+    path: String,
+    // Lines in the new version of the file, end inclusive.
+    lines: (usize, usize),
+}
+
+impl Hunk {
+    // E.g. "src/main.rs:12-20".
+    fn location(&self) -> String {
+        match self.lines {
+            (first, last) if first == last => format!("{}:{first}", self.path),
+            (first, last) => format!("{}:{first}-{last}", self.path),
+        }
+    }
+}
+
+// Soft-wraps at exactly `width` columns, so scrolling can count screen rows. Also returns the hunks. Expects paths without "a/" and "b/" prefixes.
+fn wrap(text: &Text<'static>, width: usize) -> (Text<'static>, Vec<Hunk>) {
     let mut rows = Vec::with_capacity(text.lines.len());
-    let mut hunks: Vec<(usize, usize)> = Vec::new();
+    let mut hunks: Vec<Hunk> = Vec::new();
     let mut in_hunk = false;
+    let (mut old_path, mut path) = (String::new(), String::new());
     for line in &text.lines {
-        let starts_with = |prefix: &str| line.spans.iter().flat_map(|s| s.content.chars()).take(prefix.len()).eq(prefix.chars());
-        if in_hunk && (starts_with("@@ ") || starts_with("diff ")) {
-            hunks.last_mut().unwrap().1 = rows.len();
+        let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        if in_hunk && (plain.starts_with("@@ ") || plain.starts_with("diff ")) {
+            hunks.last_mut().unwrap().end = rows.len();
             in_hunk = false;
         }
-        if starts_with("@@ ") {
-            hunks.push((rows.len(), rows.len()));
+        if !in_hunk && let Some(p) = plain.strip_prefix("--- ") {
+            old_path = p.trim_end().to_string();
+        } else if !in_hunk && let Some(p) = plain.strip_prefix("+++ ") {
+            let p = p.trim_end();
+            path = if p == "/dev/null" { old_path.clone() } else { p.to_string() };
+        }
+        if plain.starts_with("@@ ") {
+            hunks.push(Hunk { start: rows.len(), end: rows.len(), path: path.clone(), lines: new_lines(&plain) });
             in_hunk = true;
         }
 
@@ -1099,9 +1237,17 @@ fn wrap(text: &Text<'static>, width: usize) -> (Text<'static>, Vec<(usize, usize
         rows.push(Line::from(row).style(line.style));
     }
     if in_hunk {
-        hunks.last_mut().unwrap().1 = rows.len();
+        hunks.last_mut().unwrap().end = rows.len();
     }
     (Text::from(rows), hunks)
+}
+
+// The new file's lines from a header like "@@ -3,2 +4,5 @@". A hunk that only removes lines gives the line they were after.
+fn new_lines(header: &str) -> (usize, usize) {
+    let range = header.split_whitespace().nth(2).unwrap_or("+1").trim_start_matches('+');
+    let (start, count) = range.split_once(',').unwrap_or((range, "1"));
+    let (start, count): (usize, usize) = (start.parse().unwrap_or(1), count.parse().unwrap_or(1));
+    (start, start + count.max(1) - 1)
 }
 
 // Like Git's diff-highlight: pairs up removed lines with the added lines directly after them, in order, and highlights what changed in each pair, i.e. what's between their common prefix and suffix. Pairs with less than half in common are left alone, as they're probably unrelated lines.
@@ -1160,12 +1306,12 @@ fn set_background(line: &mut Line<'static>, start: usize, end: usize, bg: Color)
 // Captures the mouse so the wheel scrolls the diff, rather than the terminal sending arrow keys.
 fn init_terminal() -> DefaultTerminal {
     let terminal = ratatui::init();
-    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
     terminal
 }
 
 fn restore_terminal() {
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
 }
 

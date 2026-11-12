@@ -30,7 +30,8 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 | `PgUp`/`PgDn`, mouse wheel | Scroll diff |
 | `Home`/`End` | Jump to top/bottom of diff |
 | `Ctrl+↑`/`Ctrl+↓` | Move the commit up/down past its neighbour |
-| `j`/`k` | Next/previous hunk |
+| `j`/`k`, click | Select the next/previous hunk. No hunk is selected when you switch commits; the first `j` or `k` selects the first hunk on screen. |
+| `c` | Ask Claude about the selected hunk, or the commit if none is selected |
 | `w` | Toggle hiding whitespace changes in diffs (like `git diff -w`) |
 | `r` | Reword (and optionally edit the diff) |
 | `a` | Amend the commit's files |
@@ -66,4 +67,6 @@ gg expects these, so tell your agents about the ones that involve them:
 - **One mainline:** pushes and `b` target `origin`'s default branch (`origin/HEAD`, or else `origin/main` or `origin/master`), and never force.
 - **Worktrees are workspaces:** a linked worktree's branch is treated as a local workspace for that mainline, not as a branch of its own.
 - **Rewritten commits keep their author date:** that's how gg recognises a commit someone else amended or rebased while you were editing it. `git commit --amend` and rebases keep it; a `--reset-author` doesn't.
+- **[Herdr](https://herdr.dev):** `c` sends something like `Reviewing 4fe92d, src/main.rs:12-20: <your text>` to a Claude in another pane of gg's Herdr tab, or starts `claude` with it in a new split if there's none. Focus stays on gg. Outside Herdr, `c` just says it can't.
+- **No `a/` and `b/` prefixes:** diffs are shown with `--no-prefix`, so file paths can be read straight off them.
 - **A Vim-like editor** gets the changed files in tabs, scrolled to the first change. Other editors just get the files.
