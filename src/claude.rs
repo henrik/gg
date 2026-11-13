@@ -57,8 +57,7 @@ pub fn session_id(neighbour: &Neighbour) -> Option<String> {
 // Prompts a Claude already running in another pane of this tab, or else starts one in a new split. Returns a short acknowledgement.
 pub fn send(prompt: &str, cwd: &Path, wide: bool) -> Result<String> {
     if let Some(neighbour) = neighbour()? {
-        // The space separates it from anything already typed but not sent, which it gets appended to. Claude ignores it otherwise.
-        herdr(&["agent", "prompt", &neighbour.pane, &format!(" {prompt}")])?;
+        herdr(&["agent", "prompt", &neighbour.pane, prompt])?;
         return Ok("Sent to Claude".into());
     }
 
