@@ -734,7 +734,7 @@ impl App {
             Line::from(vec!["Enter".bold().cyan(), Span::raw(" send   "), "Esc".bold().cyan(), Span::raw(" cancel")]),
         ];
         let block = Block::bordered()
-            .title(" 🦀💌 Crab-o-gram (tell Claude) ".bold())
+            .title(" 🦀💌 Crab-O-Gram (tell Claude) ".bold())
             .border_style(Style::new().fg(Color::Cyan))
             .padding(ratatui::widgets::Padding::horizontal(1));
         frame.render_widget(ratatui::widgets::Clear, modal);
