@@ -1214,7 +1214,7 @@ impl App {
             ("Home/End", "top/end"),
             ("j/k", "hunk"),
             ("w", if self.ignore_whitespace { "show whitespace" } else { "hide whitespace" }),
-            ("c", "tell Claude"),
+            ("c", "🦀💌"),
             ("?", "explain"),
             ("!", "diff"),
             ("Esc", "unselect hunk"),
