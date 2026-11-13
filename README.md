@@ -34,7 +34,7 @@ Then run `gg` in any git repo. Re-run the install after pulling changes.
 | `Esc` | Unselect the hunk |
 | `?` | Explain the selected hunk, or the whole commit if none is selected: prose with the hunks spliced in, shown in place of the diff, with hunks it doesn't cover listed at the end. Claude writes it in the background (gg switches to the commit when it's ready), so expect 15–30 seconds. |
 | `!` | Back to the plain diff, or stop an explanation that's loading |
-| `c` | Ask Claude about the selected hunk, or the commit if none is selected |
+| `c` | Tell Claude something about the selected hunk, or the commit if none is selected |
 | `w` | Toggle hiding whitespace changes in diffs (like `git diff -w`) |
 | `r` | Reword (and optionally edit the diff) |
 | `a` | Amend the commit's files |

@@ -80,6 +80,35 @@ struct Request {
     // E.g. "Reviewing 4fe92d, src/main.rs:12-20".
     context: String,
     text: String,
+    // A byte offset into `text`.
+    cursor: usize,
+}
+
+impl Request {
+    fn insert(&mut self, text: &str) {
+        self.text.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+
+    fn previous(&self, from: usize) -> usize {
+        self.text[..from].char_indices().next_back().map_or(0, |(i, _)| i)
+    }
+
+    fn next(&self, from: usize) -> usize {
+        self.text[from..].chars().next().map_or(from, |c| from + c.len_utf8())
+    }
+
+    // Where the word before the cursor starts, skipping spaces first like a shell's Ctrl+W.
+    fn word_start(&self) -> usize {
+        let before = self.text[..self.cursor].trim_end_matches(' ');
+        before.rfind(' ').map_or(0, |i| i + 1)
+    }
+
+    fn word_end(&self) -> usize {
+        let after = &self.text[self.cursor..];
+        let skipped = after.len() - after.trim_start_matches(' ').len();
+        self.cursor + skipped + after[skipped..].find(' ').unwrap_or(after.len() - skipped)
+    }
 }
 
 struct App {
@@ -226,7 +255,7 @@ impl App {
     fn handle_event(&mut self, event: Event, terminal: &mut DefaultTerminal) -> Result<bool> {
         let key = match event {
             Event::Paste(text) if self.request.is_some() => {
-                self.request.as_mut().unwrap().text.push_str(&text.split_whitespace().collect::<Vec<_>>().join(" "));
+                self.request.as_mut().unwrap().insert(&text.split_whitespace().collect::<Vec<_>>().join(" "));
                 return Ok(false);
             }
             Event::Mouse(_) if self.request.is_some() => return Ok(false),
@@ -261,19 +290,38 @@ impl App {
         self.status = None;
         if let Some(request) = &mut self.request {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
             match key.code {
                 KeyCode::Esc => self.request = None,
                 KeyCode::Enter if request.text.trim().is_empty() => self.request = None,
                 KeyCode::Enter => self.send_request(),
-                KeyCode::Char('u') if ctrl => request.text.clear(),
+                KeyCode::Char('u') if ctrl => {
+                    request.text.drain(..request.cursor);
+                    request.cursor = 0;
+                }
                 KeyCode::Char('w') if ctrl => {
-                    let kept = request.text.trim_end().rfind(' ').map_or(0, |i| i + 1);
-                    request.text.truncate(kept);
+                    let start = request.word_start();
+                    request.text.drain(start..request.cursor);
+                    request.cursor = start;
                 }
                 KeyCode::Char('c') if ctrl => self.request = None,
-                KeyCode::Char(c) => request.text.push(c),
+                KeyCode::Char('a') if ctrl => request.cursor = 0,
+                KeyCode::Char('e') if ctrl => request.cursor = request.text.len(),
+                KeyCode::Home => request.cursor = 0,
+                KeyCode::End => request.cursor = request.text.len(),
+                KeyCode::Left if ctrl || alt => request.cursor = request.word_start(),
+                KeyCode::Right if ctrl || alt => request.cursor = request.word_end(),
+                KeyCode::Left => request.cursor = request.previous(request.cursor),
+                KeyCode::Right => request.cursor = request.next(request.cursor),
+                KeyCode::Char(c) => request.insert(c.encode_utf8(&mut [0; 4])),
                 KeyCode::Backspace => {
-                    request.text.pop();
+                    let start = request.previous(request.cursor);
+                    request.text.drain(start..request.cursor);
+                    request.cursor = start;
+                }
+                KeyCode::Delete => {
+                    let end = request.next(request.cursor);
+                    request.text.drain(request.cursor..end);
                 }
                 _ => {}
             }
@@ -652,7 +700,7 @@ impl App {
             Some(hunk) => format!("Reviewing {what}, {}", hunk.location()),
             None => format!("Reviewing {what}"),
         };
-        self.request = Some(Request { context, text: String::new() });
+        self.request = Some(Request { context, text: String::new(), cursor: 0 });
     }
 
     fn send_request(&mut self) {
@@ -670,9 +718,8 @@ impl App {
         let area = frame.area();
         let width = (area.width * 3 / 4).clamp(40.min(area.width), area.width);
         let inner_width = width.saturating_sub(4).max(1) as usize;
-        let text = format!("{}▏", request.text);
         let rows = |s: &str| s.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() / inner_width + 1;
-        let height = ((rows(&request.context) + rows(&text) + 4) as u16).min(area.height);
+        let height = ((rows(&request.context) + rows(&request.text) + 4) as u16).min(area.height);
         let modal = ratatui::layout::Rect {
             x: area.x + (area.width - width) / 2,
             y: area.y + area.height.saturating_sub(height) / 2,
@@ -682,12 +729,12 @@ impl App {
 
         let lines = vec![
             Line::from(request.context.clone()).fg(DIM),
-            Line::raw(text),
+            input_line(&request.text, request.cursor),
             Line::raw(""),
             Line::from(vec!["Enter".bold().cyan(), Span::raw(" send   "), "Esc".bold().cyan(), Span::raw(" cancel")]),
         ];
         let block = Block::bordered()
-            .title(" Ask Claude ".bold())
+            .title(" 🦀💌 Crab-o-gram (tell Claude) ".bold())
             .border_style(Style::new().fg(Color::Cyan))
             .padding(ratatui::widgets::Padding::horizontal(1));
         frame.render_widget(ratatui::widgets::Clear, modal);
@@ -1167,7 +1214,7 @@ impl App {
             ("Home/End", "top/end"),
             ("j/k", "hunk"),
             ("w", if self.ignore_whitespace { "show whitespace" } else { "hide whitespace" }),
-            ("c", "ask Claude"),
+            ("c", "tell Claude"),
             ("?", "explain"),
             ("!", "diff"),
             ("Esc", "unselect hunk"),
@@ -1716,6 +1763,15 @@ fn commits(count: usize) -> String {
 fn clamp_list_width(width: u16, total: u16) -> u16 {
     let max = total.saturating_sub(MIN_PANE_WIDTH).max(MIN_PANE_WIDTH.min(total));
     width.clamp(MIN_PANE_WIDTH.min(max), max)
+}
+
+
+// Text being typed, with the character under the cursor (or a space after the end) reversed.
+fn input_line(text: &str, cursor: usize) -> Line<'static> {
+    let (before, rest) = text.split_at(cursor);
+    let mut chars = rest.chars();
+    let under = chars.next().map_or(" ".to_string(), String::from);
+    Line::from(vec![Span::raw(before.to_string()), Span::raw(under).reversed(), Span::raw(chars.as_str().to_string())])
 }
 
 #[cfg(test)]
