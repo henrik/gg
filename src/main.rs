@@ -1317,7 +1317,7 @@ impl App {
                 if base_hash.as_deref() == Some(c.hash.as_str())
                     && let Some(base) = &self.base
                 {
-                    second.push(Span::styled(format!("[{base}]"), Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+                    second.push(Span::styled(format!("[{base}]"), Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
                     second.push(Span::raw(" "));
                 }
                 let summary_style = if c.stale { style(Color::Reset).add_modifier(Modifier::CROSSED_OUT) } else { style(Color::Reset) };
